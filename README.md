@@ -11,6 +11,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.77+-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?logo=windows11&logoColor=white)](https://.microsoft.com/windows)
 [![.NET](https://img.shields.io/badge/.NET%208-仅桥接进程-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/)
+[![Release](https://img.shields.io/github/v/release/sdhack/glm-desktop-thermometer)](https://github.com/sdhack/glm-desktop-thermometer/releases/latest)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](#license)
 
 </div>

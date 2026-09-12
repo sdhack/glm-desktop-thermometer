@@ -1,6 +1,6 @@
 [package]
 name = "tempmon-ui"
-version.workspace = true
+version = "1.0.0"
 edition.workspace = true
 
 [[bin]]
