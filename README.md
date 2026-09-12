@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/icon.png" width="128" alt="icon"/>
+
 # 🌡️ GLM 桌面温度计
 
 **一枚钉在桌面右上角的半透明系统监控小部件**

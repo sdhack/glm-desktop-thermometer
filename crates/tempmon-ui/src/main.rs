@@ -416,6 +416,24 @@ fn main() -> windows::core::Result<()> {
         SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), Some(hinst), 0);
         SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), Some(hinst), 0);
 
+        // 窗口图标（嵌入的 ico 资源，ID 1）
+        {
+            let icon = windows::Win32::UI::WindowsAndMessaging::LoadImageW(
+                Some(hinst),
+                PCWSTR::from_raw(1 as _),
+                windows::Win32::UI::WindowsAndMessaging::IMAGE_ICON,
+                0,
+                0,
+                windows::Win32::UI::WindowsAndMessaging::LR_DEFAULTSIZE,
+            )
+            .unwrap_or_default();
+            let _ = windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                hwnd,
+                0x0080, // WM_SETICON
+                Some(WPARAM(1)), // ICON_BIG
+                Some(LPARAM(icon.0 as isize)),
+            );
+        }
         (*ptr).tick()?;
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         SetTimer(Some(hwnd), TIMER_ID, (*ptr).refresh_ms, None);
