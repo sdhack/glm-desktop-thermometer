@@ -1,0 +1,18 @@
+[package]
+name = "tempmon-sensor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Graphics_Dxgi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+] }

@@ -1,0 +1,14 @@
+# 构建产物
+target/
+lhm-bridge/target/
+lhm-bridge/bin/
+lhm-bridge/obj/
+
+# 运行时文件
+PresentMon.exe
+*.csv
+*.log
+
+# 系统文件
+Thumbs.db
+.DS_Store

@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/tempmon-ui", "crates/tempmon-sensor"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
