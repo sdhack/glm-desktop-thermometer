@@ -57,7 +57,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCaptu
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DispatchMessageW, DestroyMenu, GetMessageW, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
-    KillTimer, LoadCursorW, SendMessageW, PostMessageW, RegisterClassExW, SetForegroundWindow,
+    GetClassNameW, KillTimer, LoadCursorW, SendMessageW, PostMessageW, RegisterClassExW,
+    SetForegroundWindow,
     SetTimer, SetWindowDisplayAffinity, SetWindowsHookExW, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, SystemParametersInfoW, TrackPopupMenu, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
     EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, GWL_EXSTYLE,
@@ -68,7 +69,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WDA_NONE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_APP, WM_COMMAND,
     WM_DESTROY, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_TIMER, WNDCLASSEXW, WINEVENT_SKIPOWNPROCESS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WindowFromPoint, WM_TIMER, WNDCLASSEXW, WINEVENT_SKIPOWNPROCESS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
 };
 
@@ -1531,6 +1532,21 @@ impl App {
                 }
                 if req.h < 24 { bh >= 1 } else { bh >= 2 && bh * 2 > bt }
             });
+            // 标题栏按钮区（最小化/最大化/关闭）用窗口枚举识别，
+            // 细线图标的边缘密度注定低于内容阈值
+            let mut cap_hit = false;
+            if !has {
+                let mut sx = req.x + req.w - 8;
+                let sy = req.y + req.h / 2;
+                while sx >= req.x {
+                    if caption_zone_hit(sx, sy) {
+                        cap_hit = true;
+                        break;
+                    }
+                    sx -= 24;
+                }
+            }
+            let has = has || cap_hit;
             if in_bounds && !has {
                 self.dctx = None;
                 return; // 常态：无遮挡
@@ -1798,6 +1814,33 @@ unsafe fn set_no_shadow(hwnd: HWND) {
         &none as *const _ as *const core::ffi::c_void,
         4,
     );
+}
+
+/// 采样点是否落在某个窗口右上角的标题栏按钮区（最小化/最大化/关闭）。
+/// 最小化按钮只有一条 1px 细线，边缘密度注定低于内容阈值，
+/// 但所有 Win11 应用的窗口控制按钮都固定在窗口右上角，用窗口枚举识别。
+/// 自身是 WS_EX_TRANSPARENT 穿透窗口，WindowFromPoint 会跳过它。
+unsafe fn caption_zone_hit(x: i32, y: i32) -> bool {
+    let hwnd = WindowFromPoint(POINT { x, y });
+    if hwnd.is_invalid() {
+        return false;
+    }
+    let mut cls = [0u16; 64];
+    let n = GetClassNameW(hwnd, &mut cls);
+    let cls = String::from_utf16_lossy(&cls[..n as usize]);
+    // 排除桌面与任务栏（它们矩形覆盖全屏/全宽，会误报出假的“按钮区”）
+    if matches!(
+        cls.as_str(),
+        "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+    ) {
+        return false;
+    }
+    let mut r = RECT::default();
+    if GetWindowRect(hwnd, &mut r).is_err() {
+        return false;
+    }
+    // 右上角 160×45px 区域：Win11 最小化/最大化/关闭三按钮的位置
+    x > r.right - 160 && x <= r.right && y >= r.top && y < r.top + 45
 }
 
 /// 对截屏像素计算内容图（整条只算一次，供所有候选位置复用）：
