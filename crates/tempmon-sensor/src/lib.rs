@@ -131,10 +131,13 @@ impl SensorHub {
         // 硬盘温度（NVMe/SMART，免驱动；读不到的盘自动隐藏）
         s.disk_temps = disk_temps();
 
-        // CPU 温度与风扇转速：来自 lhm-bridge 子进程的解析缓存
+        // CPU 温度与风扇转速：来自 lhm-bridge 子进程的解析缓存（过期视为无效）
         if let Ok(c) = LHM_CACHE.lock() {
-            s.cpu_temp = c.0;
-            s.fans = c.1.clone();
+            let fresh = c.2.is_some_and(|t| t.elapsed() < LHM_TTL);
+            if fresh {
+                s.cpu_temp = c.0;
+                s.fans = c.1.clone();
+            }
         }
 
         // GPU 温度：NVML 优先，NVAPI 兜底（懒加载）
@@ -462,22 +465,39 @@ pub fn write_frame(ptr: *mut u8, s: &Snapshot) {
         put(SLOT_FAN1, s.fans.first().copied(), None);
         put(SLOT_FAN2, s.fans.get(1).copied(), None);
         put(SLOT_FAN3, s.fans.get(2).copied(), None);
+        // 序号以 u32 位模式存进 f32 槽：直接存 f32 会在 2^24 后无法递增，
+        // 导致父进程误判子进程卡死而无限重拉
         let seq = if (*f).slots[SLOT_SEQ].has == 1 {
-            (*f).slots[SLOT_SEQ].v as u32 + 1
+            f32::from_bits((*f).slots[SLOT_SEQ].v.to_bits()).to_bits().wrapping_add(1)
         } else {
             1
         };
-        put(SLOT_SEQ, None, Some(seq));
+        (*f).slots[SLOT_SEQ] = F32Slot { has: 1, v: f32::from_bits(seq) };
     }
 }
 
 /// 读帧序号（父进程判断子进程是否存活）
 pub fn frame_seq(ptr: *const u8) -> u32 {
-    unsafe { (*(ptr as *const Frame)).slots[SLOT_SEQ].v as u32 }
+    unsafe { f32::from_bits((*(ptr as *const Frame)).slots[SLOT_SEQ].v.to_bits()).to_bits() }
 }
 
-/// 共享内存帧 → Snapshot（magic 不对时返回 None，由 UI 层兜底处理）
+/// 共享内存帧 → Snapshot（magic 不对时返回 None，由 UI 层兜底处理）。
+/// 读写无锁：读前后各取一次序号，不一致说明采样中被写穿，丢弃本帧。
 pub fn read_frame(ptr: *const u8) -> Option<Snapshot> {
+    unsafe {
+        if (*(ptr as *const Frame)).magic != FRAME_MAGIC {
+            return None;
+        }
+        let seq0 = frame_seq(ptr);
+        let snap = read_frame_inner(ptr)?;
+        if frame_seq(ptr) != seq0 {
+            return None;
+        }
+        Some(snap)
+    }
+}
+
+fn read_frame_inner(ptr: *const u8) -> Option<Snapshot> {
     unsafe {
         let f = ptr as *const Frame;
         if (*f).magic != FRAME_MAGIC {
@@ -533,12 +553,12 @@ pub fn sensor_loop() {
         loop {
             let snap = hub.sample();
             write_frame(view.Value as *mut u8, &snap);
-            // 刷新间隔跟配置走（UI 菜单可调，写回 tempmon.conf）
+            // 刷新间隔跟配置走（UI 菜单可调，写回 tempmon.conf 的 refresh= 行）
             let ms = std::fs::read_to_string(config_refresh_ms())
                 .ok()
                 .and_then(|t| {
                     t.lines().find_map(|l| {
-                        l.strip_prefix("refresh_ms=")
+                        l.strip_prefix("refresh=")
                             .and_then(|v| v.trim().parse::<u32>().ok())
                     })
                 })
@@ -553,14 +573,6 @@ pub fn sensor_loop() {
 // 硬盘温度：IOCTL_STORAGE_QUERY_PROPERTY 温度属性（NVMe/SATA 通用，免驱动）
 // ---------------------------------------------------------------------------
 
-const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x2D1400;
-
-#[repr(C)]
-struct StoragePropertyQuery {
-    property_id: u32,
-    query_type: u32,
-}
-
 /// 硬盘温度缓存：由轮询线程每 60 秒刷新一次（盘温变化慢，无需高频采样）
 pub fn disk_temps() -> Vec<f32> {
     DISK_CACHE.lock().map(|c| c.clone()).unwrap_or_default()
@@ -568,7 +580,7 @@ pub fn disk_temps() -> Vec<f32> {
 
 static DISK_CACHE: std::sync::Mutex<Vec<f32>> = std::sync::Mutex::new(Vec::new());
 
-/// 启动盘温轮询线程：经 Get-StorageReliabilityCounter 读取（与存储栈同源，免驱动）
+/// 启动盘温轮询线程：原生 IOCTL 直读（免子进程）
 pub fn spawn_disk_poller() {
     std::thread::spawn(|| loop {
         if let Some(temps) = query_disk_temps() {
@@ -582,7 +594,18 @@ pub fn spawn_disk_poller() {
     });
 }
 
+/// 读取 PhysicalDrive0..15 的温度。优先零开销的原生 IOCTL（部分盘不支持），
+/// 不支持时回退 PowerShell Get-StorageReliabilityCounter。返回摄氏度，最多两块盘。
 fn query_disk_temps() -> Option<Vec<f32>> {
+    if let Some(t) = query_disk_temps_native() {
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    query_disk_temps_fallback()
+}
+
+fn query_disk_temps_fallback() -> Option<Vec<f32>> {
     use std::os::windows::process::CommandExt;
     // CREATE_NO_WINDOW，避免闪黑框
     let out = std::process::Command::new("powershell")
@@ -607,12 +630,94 @@ fn query_disk_temps() -> Option<Vec<f32>> {
     Some(temps)
 }
 
+/// 原生路径：IOCTL_STORAGE_QUERY_PROPERTY / StorageDeviceTemperatureProperty。
+/// 不少 SATA/NVMe 盘对该属性返回 ERROR_NOT_SUPPORTED，此时走 PowerShell 回退。
+fn query_disk_temps_native() -> Option<Vec<f32>> {
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_FLAGS_AND_ATTRIBUTES, OPEN_EXISTING,
+    };
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ};
+    use windows::Win32::System::IO::DeviceIoControl;
+
+    const STORAGE_DEVICE_TEMPERATURE_PROPERTY: u32 = 13;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct StoragePropertyQuery {
+        property_id: u32,
+        query_type: u32,
+    }
+
+    let mut temps: Vec<f32> = Vec::new();
+    unsafe {
+        for i in 0..16u32 {
+            let path: Vec<u16> = format!("\\\\.\\PhysicalDrive{i}\0").encode_utf16().collect();
+            let Ok(h) = CreateFileW(
+                windows::core::PCWSTR::from_raw(path.as_ptr()),
+                GENERIC_READ.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                None,
+            ) else {
+                continue;
+            };
+            let query = StoragePropertyQuery {
+                property_id: STORAGE_DEVICE_TEMPERATURE_PROPERTY,
+                query_type: 0,
+            };
+            let mut out = [0u8; 64];
+            let mut ret = 0u32;
+            let ok = DeviceIoControl(
+                h,
+                0x002D_1400, // IOCTL_STORAGE_QUERY_PROPERTY
+                Some(&query as *const _ as _),
+                size_of::<StoragePropertyQuery>() as u32,
+                Some(out.as_mut_ptr() as _),
+                out.len() as u32,
+                Some(&mut ret),
+                None,
+            );
+            let _ = CloseHandle(h);
+            if ok.is_err() || ret < 16 {
+                continue;
+            }
+            // STORAGE_TEMPERATURE_DATA：Version(4) Size(4) NumOfTripPoints(2)
+            // NumOfTemperatureSensors(2) + 每个 SENSOR：Length(2) RelativeLevel(2)
+            // Temperature(4)。单位可能为 ℃、0.1℃ 或 K，按量级归一到 ℃。
+            let n = u16::from_le_bytes([out[10], out[11]]) as usize;
+            if n == 0 || ret < 20 {
+                continue;
+            }
+            let raw = i32::from_le_bytes([out[16], out[17], out[18], out[19]]);
+            let c = if (0..=120).contains(&raw) {
+                raw as f32
+            } else if (200..=400).contains(&raw) {
+                raw as f32 - 273.15
+            } else if (0..=1200).contains(&raw) {
+                raw as f32 / 10.0
+            } else {
+                continue;
+            };
+            if (0.0..=120.0).contains(&c) && temps.len() < 2 {
+                temps.push(c);
+            }
+        }
+    }
+    (!temps.is_empty()).then_some(temps)
+}
+
 // ---------------------------------------------------------------------------
 // lhm-bridge 桥接：CPU 温度 + 风扇转速（LibreHardwareMonitorLib，无窗子进程）
 // ---------------------------------------------------------------------------
 
-type LhmData = (Option<f32>, Vec<f32>);
-static LHM_CACHE: std::sync::Mutex<LhmData> = std::sync::Mutex::new((None, Vec::new()));
+type LhmData = (Option<f32>, Vec<f32>, Option<std::time::Instant>);
+static LHM_CACHE: std::sync::Mutex<LhmData> = std::sync::Mutex::new((None, Vec::new(), None));
+
+/// 桥接数据的有效期：bridge 进程活着但卡住（不再输出）时，超时的旧值
+/// 视为无效，UI 隐藏而不是永久显示冻结的温度
+const LHM_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 启动桥接读取线程；桥接进程退出（崩溃/被杀）后 5 秒自动重启。
 /// 桥接挂进本进程的 KILL_ON_JOB_CLOSE Job：本进程（sensor）被 UI 杀掉重启时，
@@ -698,7 +803,7 @@ fn run_bridge_once(job: windows::Win32::Foundation::HANDLE) -> Option<()> {
             }
         } else if line == "END" {
             if let Ok(mut c) = LHM_CACHE.lock() {
-                *c = (cpu_temp, fans.clone());
+                *c = (cpu_temp, fans.clone(), Some(std::time::Instant::now()));
             }
             cpu_temp = None;
             fans.clear();

@@ -166,7 +166,7 @@ static TOPMOST_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicI
 static DODGE_EVENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // 进程启动时刻（用于节流的毫秒计时）
 static START_MS: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-// 上次避让检测的时刻（相对 START_MS 的毫秒数），节流窗口 700ms
+// 上次避让检测的时刻（相对 START_MS 的毫秒数），节流窗口 DODGE_THROTTLE_MS
 static DODGE_LAST_CHECK_MS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 // ── 防抖 ──
@@ -269,6 +269,9 @@ struct App {
     child: Option<Child>,
     last_seq: u32,
     stale_ticks: u32,
+    child_produced: bool,
+    respawn_streak: u32,
+    respawn_not_before: Option<Instant>,
     strategy: strategy::Strategy,
     hidden: bool,
     collapsed: bool,
@@ -347,8 +350,8 @@ fn load_config() -> Config {
                 match (k.trim(), v.trim().parse::<i32>()) {
                     ("collapsed", Ok(b)) => cfg.collapsed = b != 0,
                     ("alpha", Ok(a)) if (60..=255).contains(&a) => cfg.alpha = a as u8,
-                    ("capsule", Ok(v)) => cfg.capsule_items = v as u32,
-                    ("row", Ok(v)) => cfg.row_items = v as u32,
+                    ("capsule", Ok(v)) if (0..0x200).contains(&v) => cfg.capsule_items = v as u32,
+                    ("row", Ok(v)) if (0..0x20).contains(&v) => cfg.row_items = v as u32,
                     ("rotate", Ok(v)) if (500..=10000).contains(&v) => cfg.rotate_ms = v as u32,
                     ("refresh", Ok(v)) if (250..=5000).contains(&v) => cfg.refresh_ms = v as u32,
                     ("bg", Ok(v)) if (0..=3).contains(&v) => cfg.bg_mode = v as u8,
@@ -372,8 +375,14 @@ fn load_config() -> Config {
 
 fn save_config(cfg: &Config) {
     if let Some(p) = config_path() {
+        // pos=None（吸附右上角）不写 x/y 行：写了 0/0 会被 load 读回 Some((0,0))，
+        // 重启后温度计会钉在屏幕左上角
+        let pos_line = match cfg.pos {
+            Some(q) => format!("x={}\ny={}\n", q.x, q.y),
+            None => String::new(),
+        };
         let text = format!(
-            "collapsed={}\nalpha={}\ncapsule={}\nrow={}\nrotate={}\nrefresh={}\nbg={}\ndodge={}\nx={}\ny={}\n",
+            "collapsed={}\nalpha={}\ncapsule={}\nrow={}\nrotate={}\nrefresh={}\nbg={}\ndodge={}\n{}",
             cfg.collapsed as u8,
             cfg.alpha,
             cfg.capsule_items,
@@ -382,16 +391,17 @@ fn save_config(cfg: &Config) {
             cfg.refresh_ms,
             cfg.bg_mode,
             cfg.dodge_secs,
-            cfg.pos.map(|q| q.x).unwrap_or(0),
-            cfg.pos.map(|q| q.y).unwrap_or(0),
+            pos_line,
         );
         let _ = std::fs::write(p, text);
     }
 }
 
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+
 fn autostart_enabled() -> bool {
-    std::process::Command::new("schtasks")
-        .args(["/Query", "/TN", APP_NAME])
+    std::process::Command::new("reg")
+        .args(["query", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", APP_NAME])
         .creation_flags(0x0800_0000)
         .output()
         .map(|o| o.status.success())
@@ -399,18 +409,18 @@ fn autostart_enabled() -> bool {
 }
 
 fn set_autostart(enable: bool) {
+    // HKCU Run：无需管理员权限，schtasks ONLOGON 在普通账户下会静默失败
     let exe = std::env::current_exe().map(|e| e.display().to_string()).unwrap_or_default();
+    let key = format!(r"HKCU\{}", RUN_KEY);
     if enable {
-        let _ = std::process::Command::new("schtasks")
-            .args([
-                "/Create", "/TN", APP_NAME, "/SC", "ONLOGON", "/DELAY", "0000:30",
-                "/TR", &format!("\"{}\"", exe), "/F",
-            ])
+        let _ = std::process::Command::new("reg")
+            .args(["add", &key, "/v", APP_NAME, "/t", "REG_SZ",
+                   "/d", &format!("\"{}\"", exe), "/f"])
             .creation_flags(0x0800_0000)
             .output();
     } else {
-        let _ = std::process::Command::new("schtasks")
-            .args(["/Delete", "/TN", APP_NAME, "/F"])
+        let _ = std::process::Command::new("reg")
+            .args(["delete", &key, "/v", APP_NAME, "/f"])
             .creation_flags(0x0800_0000)
             .output();
     }
@@ -425,6 +435,16 @@ fn main() -> windows::core::Result<()> {
     }
 
     unsafe {
+        // 单实例保护：多开会导致两个 widget 叠放、两个 sensor 竞写同一块
+        // 命名共享内存、避让逻辑互相触发。持有互斥体直到进程退出。
+        let mutex = windows::Win32::System::Threading::CreateMutexW(None, false, w!("Local\\TempmonWidgetInstance"))?;
+        if mutex.is_invalid()
+            || windows::Win32::Foundation::GetLastError()
+                == windows::Win32::Foundation::ERROR_ALREADY_EXISTS
+        {
+            return Ok(());
+        }
+
         let _ = START_MS.set(std::time::Instant::now());
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -597,6 +617,9 @@ impl App {
                 child: None,
                 last_seq: 0,
                 stale_ticks: 99,
+                child_produced: false,
+                respawn_streak: 0,
+                respawn_not_before: None,
                 strategy: strategy::Strategy::new(),
                 hidden: false,
                 collapsed: cfg.collapsed,
@@ -652,10 +675,20 @@ impl App {
     }
 
     fn ensure_sensor_alive(&mut self) {
+        // 重拉退避：上一个子进程从未产出过帧（启动即崩）时按倍数拉长间隔，
+        // 避免环境性故障导致每 6 秒无限拉起进程（连带 bridge 生灭）
+        if let Some(t) = self.respawn_not_before {
+            if Instant::now() < t {
+                return;
+            }
+        }
         let stale = if self.view.is_null() {
             true
         } else {
             let seq = frame_seq(self.view);
+            if seq != self.last_seq {
+                self.child_produced = true;
+            }
             let s = if seq == self.last_seq {
                 self.stale_ticks + 1
             } else {
@@ -672,6 +705,11 @@ impl App {
             let _ = old.kill();
             let _ = old.wait();
         }
+        if self.child_produced {
+            self.respawn_streak = 0;
+        } else {
+            self.respawn_streak = (self.respawn_streak + 1).min(5);
+        }
         if let Ok(exe) = std::env::current_exe() {
             if let Ok(child) = std::process::Command::new(exe)
                 .env("TEMPMON_SENSOR", "1")
@@ -682,6 +720,9 @@ impl App {
                     let _ = AssignProcessToJobObject(self.job, HANDLE(child.as_raw_handle() as _));
                 }
                 self.child = Some(child);
+                self.child_produced = false;
+                let delay = std::time::Duration::from_secs(6 << self.respawn_streak.min(4));
+                self.respawn_not_before = Some(Instant::now() + delay);
             }
         }
     }
@@ -2165,7 +2206,7 @@ unsafe extern "system" fn dodge_event_hook(
         return;
     }
     DODGE_EVENT.store(true, std::sync::atomic::Ordering::Relaxed);
-    // 节流 700ms（读上次检测时刻，不写入——由 dodge_if_occluding 统一记账）
+    // 节流 DODGE_THROTTLE_MS（读上次检测时刻，不写入——由 dodge_if_occluding 统一记账）
     let now = START_MS
         .get_or_init(std::time::Instant::now)
         .elapsed()
@@ -2440,6 +2481,11 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            let ptr = app_ptr(hwnd);
+            if !ptr.is_null() {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                drop(Box::from_raw(ptr));
+            }
             PostQuitMessage(0);
             LRESULT(0)
         }
