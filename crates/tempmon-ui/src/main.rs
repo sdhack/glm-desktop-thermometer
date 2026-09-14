@@ -95,6 +95,9 @@ struct DodgeCtx {
     cur_w: i32,
     left0: i32,
     wa: RECT,
+    /// true = 第二阶段执行"回归右缘"选位（当前未遮挡、只找更靠右的空位）；
+    /// false = 常规避让选位（当前位置被遮挡）
+    ret_right: bool,
 }
 struct CapReq {
     x: i32,
@@ -1591,7 +1594,7 @@ impl App {
             if cw <= 0 {
                 return;
             }
-            self.dctx = Some(DodgeCtx { x0, y, h, max_w, cur_w, left0, wa });
+            self.dctx = Some(DodgeCtx { x0, y, h, max_w, cur_w, left0, wa, ret_right: false });
             if !self.begin_capture(cx, y, cw, h, false) {
                 self.dctx = None;
             }
@@ -1665,8 +1668,19 @@ impl App {
             }
             let has = has || cap_hit;
             if in_bounds && !has {
-                self.dctx = None;
                 self.fb_runs = 0;
+                // 未遮挡：若曾挪离右缘且右侧还有空间，转整行检查能否回归右缘。
+                // 只迁往完全空位，不会为靠边而压住内容
+                let want_right = self.pos.is_some() && ctx.left0 + ctx.max_w < ctx.wa.right;
+                if want_right {
+                    self.dctx = Some(DodgeCtx { ret_right: true, ..ctx });
+                    let strip_x = ctx.wa.left;
+                    let strip_w = ctx.wa.right - ctx.wa.left;
+                    if self.begin_capture(strip_x, ctx.y, strip_w, ctx.h, true) {
+                        return;
+                    }
+                }
+                self.dctx = None;
                 return; // 常态：无遮挡
             }
             // 确认遮挡（或超界）：固定当前位置（此后左缘锚定向右伸展），整行截取
@@ -1756,6 +1770,27 @@ impl App {
                 Some((nx, occupied, all.0))
             })
             .collect();
+
+        // 回归右缘模式：当前未遮挡，只在完全空位中挑最靠右的（x 最大）；
+        // 已在最右（无更靠右空位）则原地不动
+        if ctx.ret_right {
+            let best = evaluated
+                .iter()
+                .filter(|(_, occupied, _)| !occupied)
+                .map(|&(nx, _, _)| nx)
+                .max();
+            if let Some(nx) = best {
+                if nx > ctx.left0 {
+                    self.fb_x = 0;
+                    self.fade_x = nx;
+                    self.fade_y = ctx.y;
+                    self.dodging = true;
+                    self.fade_phase = 1;
+                    let _ = SetTimer(Some(self.hwnd), DODGE_TIMER_ID, DODGE_TIMER_MS, None);
+                }
+            }
+            return;
+        }
 
         // 第一优先：右侧最近空位；其次：左侧最近空位
         let mut target = evaluated
