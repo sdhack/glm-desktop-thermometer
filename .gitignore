@@ -6,6 +6,7 @@ lhm-bridge/obj/
 
 # 运行时文件
 PresentMon.exe
+lhm-bridge.sys
 *.csv
 *.log
 
