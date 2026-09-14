@@ -13,3 +13,5 @@ lhm-bridge.sys
 # 系统文件
 Thumbs.db
 .DS_Store
+tools/cap_*.bmp
+tools/dump_crop.png
