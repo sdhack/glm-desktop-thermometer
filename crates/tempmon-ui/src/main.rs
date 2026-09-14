@@ -1492,6 +1492,8 @@ impl App {
             let left0 = if self.pos.is_some() { x0 } else { r.right - max_w };
             let cx = left0.max(wa.left);
             let cw = ((left0 + max_w).min(wa.right) - cx).max(0);
+            // 外扩 16px：骑在占位边缘上的小图标（只压住一角）也能完整进块被检出
+            let cw = (cw + 16).min(wa.right - cx).max(0);
             if cw <= 0 {
                 return;
             }
