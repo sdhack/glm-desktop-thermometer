@@ -36,9 +36,9 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, CreateRoundRectRgn, DeleteDC, DeleteObject, GetDC,
-    ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, BITMAPINFO,
-    BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    BitBlt, CreateCompatibleDC, CreateDIBSection, CreateRoundRectRgn, DeleteDC, DeleteObject,
+    GetDC, ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
@@ -57,22 +57,55 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCaptu
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DispatchMessageW, DestroyMenu, GetMessageW, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
-    LoadCursorW, SendMessageW, PostMessageW, RegisterClassExW, SetForegroundWindow, SetTimer,
-    SetWindowsHookExW, SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW,
-    TrackPopupMenu, EVENT_SYSTEM_FOREGROUND, GWL_EXSTYLE, GWLP_USERDATA, HTCAPTION, HTCLIENT,
-    HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT, MF_CHECKED, MF_ENABLED, MF_GRAYED,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, PostQuitMessage, SPI_GETWORKAREA,
-    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, TPM_LEFTALIGN,
-    TPM_RIGHTBUTTON, ULW_ALPHA, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_APP,
-    WM_COMMAND, WM_DESTROY, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    KillTimer, LoadCursorW, SendMessageW, PostMessageW, RegisterClassExW, SetForegroundWindow,
+    SetTimer, SetWindowDisplayAffinity, SetWindowsHookExW, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, SystemParametersInfoW, TrackPopupMenu, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
+    EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, GWL_EXSTYLE,
+    GWLP_USERDATA, HTCAPTION, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST, IDC_ARROW, KBDLLHOOKSTRUCT,
+    MSLLHOOKSTRUCT, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    MF_UNCHECKED, PostQuitMessage, SPI_GETWORKAREA, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, TPM_LEFTALIGN, TPM_RIGHTBUTTON, ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE,
+    WDA_NONE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WM_APP, WM_COMMAND,
+    WM_DESTROY, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_TIMER, WNDCLASSEXW, WINEVENT_SKIPOWNPROCESS, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 // ── 常量 ──
 
 const TIMER_ID: usize = 1;
+const DODGE_TIMER_ID: usize = 2;
+const CAP_TIMER_ID: usize = 3;
+// 排除标志生效到截屏之间的等待（定时器，不阻塞 UI 线程）
+const CAP_CAPTURE_DELAY_MS: u32 = 45;
+// 检测上下文：请求阶段计算一次，截屏回调中复用
+#[derive(Clone, Copy)]
+struct DodgeCtx {
+    x0: i32,
+    y: i32,
+    h: i32,
+    max_w: i32,
+    cur_w: i32,
+    left0: i32,
+    wa: RECT,
+}
+struct CapReq {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    full: bool,
+    excluded: bool,
+    hidden: bool,
+}
+
+// ── 防遮挡自动避让 ──
+// 周期可在菜单自定义（DODGE_CHOICES_SECS，0 = 关闭）；
+// 若检测到遮挡则向右优先找空位，淡出→移动→淡入
+const DODGE_TIMER_MS: u32 = 16;
+const FADE_OUT_STEP: f32 = 0.12;
+const FADE_IN_STEP: f32 = 0.08;
 const MENU_EXIT: usize = 100;
 const MENU_COLLAPSE: usize = 200;
 const MENU_ALPHA_25: usize = 205;
@@ -86,8 +119,10 @@ const MENU_ROW_BASE: usize = 250;
 const MENU_ROTATE_BASE: usize = 260;
 const MENU_REFRESH_BASE: usize = 270;
 const MENU_BG_BASE: usize = 280;
+const MENU_DODGE_BASE: usize = 290;
 const WM_APP_CTRL: u32 = WM_APP + 1;
 const WM_APP_WHEEL: u32 = WM_APP + 2;
+const WM_APP_DODGE: u32 = WM_APP + 3;
 const APP_NAME: &str = "TempmonWidget";
 
 const EDGE_MARGIN: f32 = 8.0;
@@ -99,6 +134,8 @@ const GAP: f32 = 1.0;
 
 const ROTATE_CHOICES_MS: [u32; 4] = [1000, 2000, 3000, 5000];
 const REFRESH_CHOICES_MS: [u32; 3] = [500, 1000, 2000];
+// 防遮挡检测开关：0 = 关闭，1 = 开启（事件驱动：窗口变化即检测，无轮询）
+const DODGE_CHOICES_SECS: [u32; 2] = [0, 1];
 
 const CAPS_MAXTEMP: u32 = 1 << 0;
 const CAPS_CPU: u32 = 1 << 1;
@@ -119,6 +156,12 @@ const ROW_FAN: u32 = 1 << 4;
 const ROW_DEFAULT: u32 = ROW_CPU | ROW_GPU | ROW_MEM | ROW_DISK | ROW_FAN;
 
 static TOPMOST_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+// 事件驱动防遮挡：其他窗口发生移动/显示/隐藏/前台切换时置位，tick 中消费
+static DODGE_EVENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// 进程启动时刻（用于节流的毫秒计时）
+static START_MS: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+// 上次避让检测的时刻（相对 START_MS 的毫秒数），节流窗口 700ms
+static DODGE_LAST_CHECK_MS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 // ── 防抖 ──
 
@@ -210,6 +253,7 @@ struct Config {
     rotate_ms: u32,
     refresh_ms: u32,
     bg_mode: u8,
+    dodge_secs: u32,
 }
 
 struct App {
@@ -251,6 +295,21 @@ struct App {
     buf_w: i32,
     buf_h: i32,
     dwm_round_ok: bool,
+    fade: f32,
+    fade_phase: u8,
+    fade_x: i32,
+    fade_y: i32,
+    dodging: bool,
+    last_dodge: Option<Instant>,
+    widest: i32,
+    last_checked_w: i32,
+    rendered_once: bool,
+    dodge_secs: u32,
+    started_at: Instant,
+    cap: Option<CapReq>,
+    dctx: Option<DodgeCtx>,
+    fb_x: i32,
+    fb_d: f32,
 }
 
 // ── 配置持久化 ──
@@ -269,6 +328,7 @@ fn load_config() -> Config {
         rotate_ms: 2000,
         refresh_ms: 1000,
         bg_mode: 0,
+        dodge_secs: 1,
     };
     if let Some(p) = config_path() {
         if let Ok(text) = std::fs::read_to_string(p) {
@@ -285,6 +345,10 @@ fn load_config() -> Config {
                     ("rotate", Ok(v)) if (500..=10000).contains(&v) => cfg.rotate_ms = v as u32,
                     ("refresh", Ok(v)) if (250..=5000).contains(&v) => cfg.refresh_ms = v as u32,
                     ("bg", Ok(v)) if (0..=3).contains(&v) => cfg.bg_mode = v as u8,
+                    ("dodge", Ok(v)) if v == 0 || (2..=3600).contains(&v) => {
+                        // 事件驱动开关：任何非 0 值视为开启
+                        cfg.dodge_secs = if v == 0 { 0 } else { 1 }
+                    }
                     ("x", Ok(x)) => {
                         cfg.pos = Some(POINT { x, y: cfg.pos.map(|q| q.y).unwrap_or(0) })
                     }
@@ -302,7 +366,7 @@ fn load_config() -> Config {
 fn save_config(cfg: &Config) {
     if let Some(p) = config_path() {
         let text = format!(
-            "collapsed={}\nalpha={}\ncapsule={}\nrow={}\nrotate={}\nrefresh={}\nbg={}\nx={}\ny={}\n",
+            "collapsed={}\nalpha={}\ncapsule={}\nrow={}\nrotate={}\nrefresh={}\nbg={}\ndodge={}\nx={}\ny={}\n",
             cfg.collapsed as u8,
             cfg.alpha,
             cfg.capsule_items,
@@ -310,6 +374,7 @@ fn save_config(cfg: &Config) {
             cfg.rotate_ms,
             cfg.refresh_ms,
             cfg.bg_mode,
+            cfg.dodge_secs,
             cfg.pos.map(|q| q.x).unwrap_or(0),
             cfg.pos.map(|q| q.y).unwrap_or(0),
         );
@@ -353,6 +418,7 @@ fn main() -> windows::core::Result<()> {
     }
 
     unsafe {
+        let _ = START_MS.set(std::time::Instant::now());
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
         let hmodule = GetModuleHandleW(None)?;
@@ -389,8 +455,8 @@ fn main() -> windows::core::Result<()> {
         let ptr = Box::into_raw(app);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
 
-        // 圆角：毛玻璃优先用 DWM 系统圆角（仅 Win11 支持）；失败（Win10/旧系统）
-        // 回退到区域裁剪（rgn 窗口无投影），否则毛玻璃层会是直角
+        // 圆角：普通模式用区域裁剪（无投影）；毛玻璃（Win11 雾面层不吃 rgn 裁剪）
+        // 用 DWM 系统圆角，并叠加属性尽量去除自带的投影
         let mut dwm_round_ok = false;
         if bg_mode0 >= 2 {
             let pref = windows::Win32::Graphics::Dwm::DWMWCP_ROUND;
@@ -401,6 +467,7 @@ fn main() -> windows::core::Result<()> {
                 4,
             );
             dwm_round_ok = hr.is_ok();
+            set_no_shadow(hwnd);
         }
         if !dwm_round_ok {
             let rgn = CreateRoundRectRgn(0, 0, 421, 41, 16, 16);
@@ -419,6 +486,22 @@ fn main() -> windows::core::Result<()> {
             0,
             WINEVENT_OUTOFCONTEXT,
         );
+        // 事件驱动防遮挡：监听其他窗口的位置变化 / 显示 / 隐藏 / 前台切换
+        for (lo, hi) in [
+            (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
+            (EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE),
+            (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+        ] {
+            SetWinEventHook(
+                lo,
+                hi,
+                None,
+                Some(dodge_event_hook),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            );
+        }
         SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), Some(hinst), 0);
         SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), Some(hinst), 0);
 
@@ -539,6 +622,21 @@ impl App {
         buf_w: 0,
         buf_h: 0,
         dwm_round_ok: false,
+        fade: 1.0,
+        fade_phase: 0,
+        fade_x: 0,
+        fade_y: 0,
+        dodging: false,
+        last_dodge: None,
+        widest: 0,
+        last_checked_w: 0,
+        rendered_once: false,
+        dodge_secs: cfg.dodge_secs,
+        started_at: Instant::now(),
+        cap: None,
+        dctx: None,
+        fb_x: 0,
+        fb_d: 0.0,
             };
             app.ensure_sensor_alive();
             Ok(app)
@@ -594,6 +692,24 @@ impl App {
         }
         self.update_clickthrough();
         self.ensure_sensor_alive();
+
+        // 事件驱动防遮挡（dodge_secs>0 时启用）：
+        // 其他窗口移动/显示/隐藏/前台切换，或自身宽度变化（翻页/形态切换）时立即检测；
+        // 屏幕无变化则零轮询。last_dodge 为避让后的防震荡冷却（未来时刻）
+        if self.dodge_secs > 0 {
+            let event = DODGE_EVENT.swap(false, std::sync::atomic::Ordering::Relaxed);
+            let mut width_changed = false;
+            unsafe {
+                let mut r = RECT::default();
+                if GetWindowRect(self.hwnd, &mut r).is_ok() && r.right - r.left != self.last_checked_w
+                {
+                    width_changed = true;
+                }
+            }
+            if event || width_changed {
+                self.dodge_if_occluding();
+            }
+        }
 
         let hide = self.strategy.should_hide();
         if hide != self.hidden {
@@ -890,6 +1006,9 @@ impl App {
             if page_laid.is_empty() {
                 return Ok(());
             }
+            // 所有翻页的总宽每帧都已排版算出：取最大者作为最宽形态宽度，
+            // 防遮挡检测无需等宽页轮播显示就能覆盖真实占位
+            let max_total = page_laid.iter().map(|(_, t)| *t).fold(0.0f32, f32::max);
             let page_idx = self.capsule_page as usize % page_laid.len();
             let (laid, parts_total) = if self.collapsed {
                 let (l, t) = page_laid[page_idx].clone();
@@ -899,10 +1018,10 @@ impl App {
                 (l, t)
             };
 
-            let w = ((parts_total - GAP * self.scale) + PAD_X * 2.0 * self.scale).ceil() as i32;
             let bar_h = if self.collapsed { CAP_H } else { BAR_H };
             let h = (bar_h * self.scale).ceil() as i32;
 
+            // 右侧空间不足时优先显示左边的内容：截掉放不下的尾部项目
             let mut wa = RECT::default();
             let _ = SystemParametersInfoW(
                 SPI_GETWORKAREA,
@@ -911,7 +1030,50 @@ impl App {
                 windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
             );
             let m = (EDGE_MARGIN * self.scale) as i32;
-            let pos = self.pos.unwrap_or(POINT { x: wa.right - w - m, y: wa.top + m });
+            let pos = self.pos.unwrap_or(POINT { x: wa.right - 420, y: wa.top + m });
+            let avail = ((wa.right - m) - pos.x) as f32;
+            let mut laid = laid;
+            let mut parts_total = parts_total;
+            let pad2 = PAD_X * 2.0 * self.scale;
+            let budget = avail - pad2;
+            if self.pos.is_some() && budget > 20.0 && parts_total > budget {
+                let mut acc = 0.0f32;
+                let mut keep = 0usize;
+                for (i, (_, _, _, slot_w)) in laid.iter().enumerate() {
+                    let add = slot_w + if keep > 0 { GAP * self.scale } else { 0.0 };
+                    if acc + add <= budget {
+                        acc += add;
+                        keep = i + 1;
+                    } else {
+                        break;
+                    }
+                }
+                laid.truncate(keep.max(1));
+                parts_total = acc;
+            }
+
+            // 渲染宽度跟随当前页（胶囊随翻页变宽变窄；被右侧裁剪时以裁剪后为准）
+            let w = ((parts_total - GAP * self.scale) + pad2).ceil() as i32;
+            // 防遮挡检测则按所有翻页中的最大宽度计算占位，
+            // 无需等宽页轮播显示就不会在翻到宽页时压住内容
+            let widest_w = ((max_total - GAP * self.scale) + PAD_X * 2.0 * self.scale).ceil() as i32;
+            if widest_w > self.widest {
+                self.widest = widest_w;
+            }
+
+            let mut pos = if let Some(p) = self.pos {
+                p
+            } else {
+                POINT { x: wa.right - w - m, y: wa.top + m }
+            };
+            // 右缘放不下时整体左移（靠左完整显示）；左缘越界同理夹回
+            let right_lim = wa.right - m;
+            if pos.x + w > right_lim {
+                pos.x = right_lim - w;
+            }
+            if pos.x < wa.left {
+                pos.x = wa.left;
+            }
 
             if self.buf_w != w || self.buf_h != h {
                 self.recreate_buffer(w, h)?;
@@ -948,7 +1110,7 @@ impl App {
                 &bg,
             );
 
-            // 普通模式或 DWM 圆角不可用（Win10 毛玻璃）时，用区域裁剪保持圆角
+            // 普通模式用区域裁剪保持圆角（无投影）；毛玻璃走 DWM 系统圆角
             if self.bg_mode < 2 || !self.dwm_round_ok {
                 let rgn = CreateRoundRectRgn(
                     0,
@@ -990,7 +1152,7 @@ impl App {
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,
-                SourceConstantAlpha: self.alpha,
+                SourceConstantAlpha: ((self.alpha as f32 * self.fade) as i32).clamp(0, 255) as u8,
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
             let screen = GetDC(None);
@@ -1005,6 +1167,7 @@ impl App {
             );
             ReleaseDC(None, screen);
 
+            self.rendered_once = true;
             Ok(())
         }
     }
@@ -1172,6 +1335,20 @@ impl App {
                 }
                 let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("刷新频率"));
             }
+            if let Ok(sub) = CreatePopupMenu() {
+                for (i, s) in DODGE_CHOICES_SECS.iter().enumerate() {
+                    let label = if *s == 0 { w!("关闭") } else { w!("开启") };
+                    let on = self.dodge_secs > 0;
+                    let checked = if *s == 0 { !on } else { on };
+                    let _ = AppendMenuW(
+                        sub,
+                        MF_STRING | if checked { MF_CHECKED } else { MF_UNCHECKED },
+                        MENU_DODGE_BASE + i,
+                        label,
+                    );
+                }
+                let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("防遮挡检测"));
+            }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
             let _ = AppendMenuW(
@@ -1225,21 +1402,356 @@ impl App {
         unsafe {
             let acrylic = self.bg_mode >= 2;
             apply_acrylic(self.hwnd, acrylic, self.bg_mode == 3);
-            // 从普通模式切回毛玻璃时清除区域裁剪，交给 DWM 系统圆角
             if acrylic && self.dwm_round_ok {
                 let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(self.hwnd, None, true);
+                set_no_shadow(self.hwnd);
+            } else if !acrylic {
+                let rgn = CreateRoundRectRgn(0, 0, 421, 41, 16, 16);
+                let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(self.hwnd, Some(rgn), true);
             }
         }
     }
 
     fn toggle_collapse(&mut self) {
         self.collapsed = !self.collapsed;
+        self.widest = 0;
         save_config(&self.as_config());
     }
 
     fn set_alpha(&mut self, alpha: u8) {
         self.alpha = alpha;
         save_config(&self.as_config());
+    }
+
+    /// 发起防遮挡检测（请求阶段，不阻塞 UI 线程）：
+    /// 计算检测区域并设置截图排除，实际截屏在 45ms 定时器回调中执行
+    fn dodge_if_occluding(&mut self) {
+        // 首次渲染前窗口还在初始位置（配置位置尚未应用），不检测不覆盖配置
+        if self.dragging || self.hidden || self.dodging || !self.rendered_once {
+            return;
+        }
+        if self.cap.is_some() {
+            return; // 上一次截取尚未完成
+        }
+        let debug = std::env::var("TEMPMON_DODGE_DEBUG").is_ok();
+        if debug {
+            eprintln!("[dodge] check at +{:.1}s", (Instant::now() - self.started_at).as_secs_f32());
+        }
+        // 节流：两次实际检测至少间隔 700ms（事件风暴/多来源触发时合并）
+        let now_ms = START_MS
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as usize;
+        if now_ms.saturating_sub(DODGE_LAST_CHECK_MS.load(std::sync::atomic::Ordering::Relaxed))
+            < 700
+        {
+            return;
+        }
+        DODGE_LAST_CHECK_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+        unsafe {
+            let mut r = RECT::default();
+            if GetWindowRect(self.hwnd, &mut r).is_err() {
+                return;
+            }
+            let h = r.bottom - r.top;
+            let cur_w = r.right - r.left;
+            let max_w = self.widest.max(cur_w);
+            let (x0, y) = (r.left, r.top);
+            self.last_checked_w = cur_w;
+            let mut wa = RECT::default();
+            let _ = SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some(&mut wa as *mut RECT as _),
+                windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            );
+            // 温度计可能变宽到 max_w：手动定位过则左缘固定向右伸展，
+            // 吸附默认态右缘固定向左伸展
+            let left0 = if self.pos.is_some() { x0 } else { r.right - max_w };
+            let cx = left0.max(wa.left);
+            let cw = ((left0 + max_w).min(wa.right) - cx).max(0);
+            if cw <= 0 {
+                return;
+            }
+            self.dctx = Some(DodgeCtx { x0, y, h, max_w, cur_w, left0, wa });
+            if !self.begin_capture(cx, y, cw, h, false) {
+                self.dctx = None;
+            }
+        }
+    }
+
+    fn debug_on(&self) -> bool {
+        std::env::var("TEMPMON_DODGE_DEBUG").is_ok()
+    }
+
+    /// 截屏定时器回调：执行截屏（毫秒级）并根据阶段继续流程
+    fn capture_timer_step(&mut self) {
+        unsafe { self.capture_timer_step_inner() }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    unsafe fn capture_timer_step_inner(&mut self) {
+        let _ = KillTimer(Some(self.hwnd), CAP_TIMER_ID);
+        let Some(req) = self.cap.take() else { return };
+        let Some(px) = self.finish_capture(req.x, req.y, req.w, req.h, req.excluded, req.hidden)
+        else {
+            return;
+        };
+        // 调试：转储检测画面
+        let dump = self.debug_on();
+        if dump {
+            let mut data = vec![0u8; 54];
+            data[0..2].copy_from_slice(b"BM");
+            data[2..6].copy_from_slice(&((54 + px.len() as u32)).to_le_bytes());
+            data[10..14].copy_from_slice(&54u32.to_le_bytes());
+            data[14..18].copy_from_slice(&40u32.to_le_bytes());
+            data[18..22].copy_from_slice(&(req.w).to_le_bytes());
+            data[22..26].copy_from_slice(&(-req.h).to_le_bytes());
+            data[26..28].copy_from_slice(&1u16.to_le_bytes());
+            data[28..30].copy_from_slice(&32u16.to_le_bytes());
+            data.extend_from_slice(&px);
+            let name = if req.full { "cap_full.bmp" } else { "cap_cur.bmp" };
+            let _ = std::fs::write(format!("D:/GLM桌面温度计260912/tools/{}", name), &data);
+        }
+        let Some(edge) = compute_edge_map(&px, req.w as usize, req.h as usize) else { return };
+        if !req.full {
+            // 第一阶段：当前占位是否压住内容；边界超界也进入重选流程
+            let Some(ctx) = self.dctx else { return };
+            let in_bounds = ctx.left0 >= ctx.wa.left && ctx.left0 + ctx.cur_w <= ctx.wa.right;
+            let stats = edge_region_stats(&edge, req.w as usize, req.h as usize, 0, req.w as usize);
+            if dump {
+                eprintln!("[dodge] phase1 w={} stats={:?}", req.w, stats);
+            }
+            let has = stats.is_some_and(|(d, bh, bt, ic)| {
+                if ic {
+                    return true;
+                }
+                if !(0.015..0.5).contains(&d) {
+                    return false;
+                }
+                if req.h < 24 { bh >= 1 } else { bh >= 2 && bh * 2 > bt }
+            });
+            if in_bounds && !has {
+                self.dctx = None;
+                return; // 常态：无遮挡
+            }
+            // 确认遮挡（或超界）：固定当前位置（此后左缘锚定向右伸展），整行截取
+            self.pos = Some(POINT { x: ctx.x0, y: ctx.y });
+            let strip_x = ctx.wa.left;
+            let strip_w = ctx.wa.right - ctx.wa.left;
+            if !self.begin_capture(strip_x, ctx.y, strip_w, ctx.h, true) {
+                self.dctx = None;
+            }
+            return;
+        }
+
+        // 第二阶段：整行边缘图上选新位置
+        let Some(ctx) = self.dctx else { return };
+        let (strip_w, h, max_w) = (req.w as usize, req.h as usize, ctx.max_w);
+        let occ = |x: i32| -> bool {
+            let ox = (x - ctx.wa.left) as usize;
+            if ox + max_w as usize > strip_w {
+                return true; // 越界视为有遮挡
+            }
+            edge_region_has_content(&edge, strip_w, h, ox, max_w as usize)
+        };
+        if dump {
+            let mut cand_log = String::new();
+            let step0 = (max_w / 2).max(40);
+            let mut s0 = step0;
+            while s0 <= (ctx.wa.right - ctx.wa.left - max_w).max(0) && cand_log.len() <= 400 {
+                for nx in [ctx.x0 - s0, ctx.x0 + s0] {
+                    if nx >= ctx.wa.left && nx + max_w <= ctx.wa.right {
+                        cand_log.push_str(&format!(" x={}occ={}", nx, occ(nx)));
+                    }
+                }
+                s0 += step0;
+            }
+            eprintln!(
+                "[dodge] occluded at ({},{}) max_w={} |{}",
+                ctx.x0, ctx.y, max_w, cand_log
+            );
+        }
+        // 候选位置：优先向右（按距离升序），右侧无空位再向左。
+        // 固定 40px 细步长：全部从同一张边缘图评估，细粒度才能找到
+        // 「只压住少量空白」的低遮挡位置（大步长会整段跳过）
+        let step = 40;
+        let max_shift = ctx.wa.right - ctx.wa.left - max_w;
+        let mut cands: Vec<i32> = Vec::new();
+        let mut shift = step;
+        while shift <= max_shift {
+            let nr = ctx.x0 + shift;
+            if nr >= ctx.wa.left && nr + max_w <= ctx.wa.right {
+                cands.push(nr);
+            }
+            shift += step;
+        }
+        let mut shift = step;
+        while shift <= max_shift {
+            let nl = ctx.x0 - shift;
+            if nl >= ctx.wa.left && nl + max_w <= ctx.wa.right {
+                cands.push(nl);
+            }
+            shift += step;
+        }
+        // 每个候选只评估一次：内容占用 + 遮挡密度
+        let evaluated: Vec<(i32, bool, f32)> = cands
+            .iter()
+            .filter_map(|&nx| {
+                let ox = (nx - ctx.wa.left) as usize;
+                if ox + max_w as usize > strip_w {
+                    return None;
+                }
+                let all = edge_region_stats(&edge, strip_w, h, ox, max_w as usize)?;
+                let occupied = occ(nx);
+                if dump {
+                    eprintln!("[dodge] cand x={} stats={:?}", nx, all);
+                }
+                Some((nx, occupied, all.0))
+            })
+            .collect();
+
+        // 第一优先：右侧最近空位；其次：左侧最近空位
+        let mut target = evaluated
+            .iter()
+            .find(|(_, occupied, _)| !occupied)
+            .map(|&(nx, _, _)| nx);
+        if target.is_some() {
+            self.fb_x = 0;
+        }
+
+        // 都没有空位：退而求其次，选遮挡密度最小的候选。
+        // 双重防震荡：①候选密度必须比当前位置低 0.01 以上（明显更优才挪）；
+        // ②已在兜底位且密度未明显上升（内容没变化）时留在原地
+        if target.is_none() && self.last_dodge.map_or(true, |t| t <= Instant::now()) {
+            let cur_d = edge_region_stats(
+                &edge,
+                strip_w,
+                h,
+                (ctx.left0 - ctx.wa.left) as usize,
+                max_w as usize,
+            )
+            .map(|s| s.0)
+            .unwrap_or(1.0);
+            // fb_d 固定为选定时的密度：只有密度较当时明显上升（内容变了）才重选
+            if self.fb_x != 0 && ctx.left0 == self.fb_x && cur_d <= self.fb_d + 0.015 {
+                return;
+            }
+            target = evaluated
+                .iter()
+                .filter(|(_, _, d)| *d < cur_d - 0.01)
+                .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|&(nx, _, _)| nx);
+            if let Some(nx) = target {
+                self.fb_x = nx;
+                self.fb_d = evaluated
+                    .iter()
+                    .find(|&(x, _, _)| *x == nx)
+                    .map(|&(_, _, d)| d)
+                    .unwrap_or(0.0);
+            }
+        }
+
+        if dump {
+            eprintln!(
+                "[dodge] phase2 done: candidates={} free={} target={:?}",
+                evaluated.len(),
+                evaluated.iter().filter(|(_, o, _)| !o).count(),
+                target,
+            );
+        }
+
+        // 确定目标位置后，淡出→挪过去→淡入
+        if let Some(nx) = target {
+            self.fade_x = nx;
+            self.fade_y = ctx.y;
+            self.dodging = true;
+            self.fade_phase = 1;
+            let _ = SetTimer(Some(self.hwnd), DODGE_TIMER_ID, DODGE_TIMER_MS, None);
+        }
+    }
+
+    /// 发起截屏：设置截图排除（瞬时，不阻塞），实际截屏在定时器回调中执行
+    unsafe fn begin_capture(&mut self, x: i32, y: i32, w: i32, h: i32, full: bool) -> bool {
+        if w <= 0 || h <= 0 || self.cap.is_some() {
+            return false;
+        }
+        let excluded = SetWindowDisplayAffinity(self.hwnd, WDA_EXCLUDEFROMCAPTURE).is_ok();
+        let mut hidden = false;
+        if !excluded {
+            // 旧系统回退：先隐藏窗口，定时器到点时截屏（短暂不可见）
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+            hidden = true;
+        }
+        self.cap = Some(CapReq { x, y, w, h, full, excluded, hidden });
+        let _ = SetTimer(Some(self.hwnd), CAP_TIMER_ID, CAP_CAPTURE_DELAY_MS, None);
+        true
+    }
+
+    /// 截屏收尾：BitBlt（毫秒级）并恢复窗口的截图可见性
+    unsafe fn finish_capture(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        excluded: bool,
+        hidden: bool,
+    ) -> Option<Vec<u8>> {
+        let px = grab_screen(x, y, w, h);
+        if excluded {
+            let _ = SetWindowDisplayAffinity(self.hwnd, WDA_NONE);
+        }
+        if hidden {
+            let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+        }
+        px
+    }
+
+    /// 淡出动画步进：先淡出，到位后移动窗口并保存位置，再淡入
+    fn fade_step(&mut self) {
+        match self.fade_phase {
+            1 => {
+                self.fade -= FADE_OUT_STEP;
+                if self.fade <= 0.0 {
+                    self.fade = 0.0;
+                    self.fade_phase = 2;
+                    unsafe {
+                        let _ = SetWindowPos(
+                            self.hwnd,
+                            Some(HWND_TOPMOST),
+                            self.fade_x,
+                            self.fade_y,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                    }
+                    self.pos = Some(POINT { x: self.fade_x, y: self.fade_y });
+                    save_config(&self.as_config());
+                }
+            }
+            2 => {
+                self.fade += FADE_IN_STEP;
+                if self.fade >= 1.0 {
+                    self.fade = 1.0;
+                    self.fade_phase = 0;
+                    self.dodging = false;
+                    // 避让完成后冷却 4 秒（完全空位移动不受限，仅限制
+                    // “最少遮挡”兜底移动），避免临界内容导致来回震荡
+                    self.last_dodge =
+                        Some(Instant::now() + std::time::Duration::from_secs(4));
+                    unsafe {
+                        let _ = KillTimer(Some(self.hwnd), DODGE_TIMER_ID);
+                    }
+                }
+            }
+            _ => {}
+        }
+        // 立即重绘以应用新的透明度（正常内容按刷新周期才重绘）
+        if self.fade_phase != 0 || self.fade < 1.0 {
+            let _ = self.tick();
+        }
     }
 
     fn as_config(&self) -> Config {
@@ -1252,6 +1764,7 @@ impl App {
             rotate_ms: self.rotate_ms,
             refresh_ms: self.refresh_ms,
             bg_mode: self.bg_mode,
+            dodge_secs: self.dodge_secs,
         }
     }
 
@@ -1264,9 +1777,191 @@ impl App {
             }
         }
     }
+
 }
 
-// ── 平台辅助 ──
+// ── 防遮挡辅助 ──
+
+/// 关闭 DWM 投影：NC 渲染禁用 + 边框无色（Win11 系统圆角默认自带阴影）
+unsafe fn set_no_shadow(hwnd: HWND) {
+    let disabled: u32 = 1; // DWMNCRENDERING_POLICY_DISABLED
+    let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+        hwnd,
+        windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(2),
+        &disabled as *const _ as *const core::ffi::c_void,
+        4,
+    );
+    let none: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE
+    let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+        hwnd,
+        windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(34), // DWMWA_BORDER_COLOR
+        &none as *const _ as *const core::ffi::c_void,
+        4,
+    );
+}
+
+/// 对截屏像素计算内容图（整条只算一次，供所有候选位置复用）：
+/// 高频边缘（文字/图标轮廓）∪ 高色差像素（平滑渐变的彩色图标/彩色文字）
+fn compute_edge_map(px: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
+    if w < 8 || h < 8 || px.len() < w * h * 4 {
+        return None;
+    }
+    let mut gray = vec![0u8; w * h];
+    for i in 0..w * h {
+        let (b, g, r) = (px[i * 4] as u32, px[i * 4 + 1] as u32, px[i * 4 + 2] as u32);
+        gray[i] = ((r * 299 + g * 587 + b * 114) / 1000) as u8;
+    }
+    let mut edge = vec![0u8; w * h];
+    for yy in 1..h - 1 {
+        for xx in 1..w - 1 {
+            let i = yy * w + xx;
+            let dx = (gray[i + 1] as i32 - gray[i - 1] as i32).abs();
+            let dy = (gray[i + w] as i32 - gray[i - w] as i32).abs();
+            let chroma = px[i * 4].max(px[i * 4 + 1]).max(px[i * 4 + 2]) as i32
+                - px[i * 4].min(px[i * 4 + 1]).min(px[i * 4 + 2]) as i32;
+            if dx + dy > 64 || chroma > 60 {
+                edge[i] = 1;
+            }
+        }
+    }
+    Some(edge)
+}
+
+/// 在边缘图上统计子区域：整体密度、命中的 8px 条带数/总数、是否含紧凑图标块
+fn edge_region_stats(
+    edge: &[u8],
+    w: usize,
+    h: usize,
+    ox: usize,
+    rw: usize,
+) -> Option<(f32, usize, usize, bool)> {
+    if rw < 8 || h < 8 || ox + rw > w {
+        return None;
+    }
+    let mut total = 0u32;
+    for yy in 1..h - 1 {
+        for xx in ox + 1..ox + rw - 1 {
+            total += edge[yy * w + xx] as u32;
+        }
+    }
+    let area = ((rw - 2) * (h - 2)) as f32;
+    if area <= 0.0 {
+        return None;
+    }
+    let density = total as f32 / area;
+
+    // 文字：固定 8px 条带覆盖全部行高（含末尾不足 8px 的部分）
+    let band = 8usize;
+    let (mut bands_hit, mut bands_total) = (0usize, 0usize);
+    let mut y0 = 1;
+    while y0 < h - 1 {
+        let ye = (y0 + band).min(h - 1);
+        let mut c = 0u32;
+        for yy in y0..ye {
+            for xx in ox + 1..ox + rw - 1 {
+                c += edge[yy * w + xx] as u32;
+            }
+        }
+        let bd = c as f32 / ((ye - y0) as f32 * (rw - 2) as f32);
+        bands_total += 1;
+        if bd > 0.03 {
+            bands_hit += 1;
+        }
+        y0 += band;
+    }
+
+    // 图标/标识等紧凑高对比内容：任一 24×24 块（步进 12 重叠扫描）密度 ≥0.08
+    let bs = 24usize;
+    let mut has_icon_block = false;
+    if rw >= bs && h >= bs {
+        // 步进 12 扫描；末尾补一个对齐区域右/下缘的块，避免边缘处的图标漏检
+        let xs: Vec<usize> = {
+            let mut v: Vec<usize> = (0..=rw - bs).step_by(12).collect();
+            let last = rw - bs;
+            if *v.last().unwrap() != last {
+                v.push(last);
+            }
+            v
+        };
+        let ys: Vec<usize> = {
+            let mut v: Vec<usize> = (0..=h - bs).step_by(12).collect();
+            let last = h - bs;
+            if *v.last().unwrap() != last {
+                v.push(last);
+            }
+            v
+        };
+        'outer: for &by in &ys {
+            for &bx in &xs {
+                let mut c = 0u32;
+                for yy in by..by + bs {
+                    for xx in ox + bx..ox + bx + bs {
+                        c += edge[yy * w + xx] as u32;
+                    }
+                }
+                if c as f32 / (bs * bs) as f32 >= 0.12 {
+                    has_icon_block = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+    Some((density, bands_hit, bands_total, has_icon_block))
+}
+
+/// 子区域是否含有文字/图标等内容
+fn edge_region_has_content(edge: &[u8], w: usize, h: usize, ox: usize, rw: usize) -> bool {
+    let Some((density, bands_hit, bands_total, has_icon_block)) =
+        edge_region_stats(edge, w, h, ox, rw)
+    else {
+        return false;
+    };
+    // 图标/标识单独判定：摊到整条后整体密度可能低于文字下限
+    if has_icon_block {
+        return true;
+    }
+    if !(0.015..0.5).contains(&density) {
+        return false;
+    }
+    // 行高较小（如 24px 的悬浮条）时文字可能只落入一两条带，只要求 1 条命中；
+    // 行高较大时要求至少 2 条且命中过半，以排除照片类内容
+    if h < 24 {
+        bands_hit >= 1
+    } else {
+        bands_hit >= 2 && bands_hit * 2 > bands_total
+    }
+}
+
+unsafe fn grab_screen(x: i32, y: i32, w: i32, h: i32) -> Option<Vec<u8>> {
+    let sdc = GetDC(None);
+    let mdc = CreateCompatibleDC(Some(sdc));
+    let mut bi = BITMAPINFO::default();
+    bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h; // 自顶向下
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB.0;
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let mut out = None;
+    if let Ok(hbmp) = CreateDIBSection(Some(mdc), &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
+        let old = SelectObject(mdc, hbmp.into());
+        if BitBlt(mdc, 0, 0, w, h, Some(sdc), x, y, SRCCOPY).is_ok() && !bits.is_null() {
+            let len = (w as usize) * (h as usize) * 4;
+            let mut buf = vec![0u8; len];
+            std::ptr::copy_nonoverlapping(bits as *const u8, buf.as_mut_ptr(), len);
+            out = Some(buf);
+        }
+        SelectObject(mdc, old);
+        let _ = DeleteObject(hbmp.into());
+    }
+    let _ = DeleteDC(mdc);
+    ReleaseDC(None, sdc);
+    out
+}
+
+/// 文字特征判断：文字区域表现为「高频边缘 + 水平条带分布」，
+/// 纯色/渐变壁纸密度极低，照片类内容密度过高且不成条带
 
 #[allow(non_snake_case)]
 unsafe fn UpdateLayeredWindowSafe(
@@ -1351,6 +2046,41 @@ unsafe fn apply_acrylic(hwnd: HWND, enable: bool, light: bool) {
         None => return,
     };
     f(hwnd, &mut data);
+}
+
+/// 防遮挡事件钩子：任何顶层窗口位置变化/显示/隐藏/前台切换时置位
+/// （WINEVENT_SKIPOWNPROCESS 已排除自身；id_object==0 即 OBJID_WINDOW，
+///  过滤掉光标、插入符等对象的高频事件）
+unsafe extern "system" fn dodge_event_hook(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    _hwnd: HWND,
+    id_object: i32,
+    _idchild: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if id_object != 0 {
+        return;
+    }
+    DODGE_EVENT.store(true, std::sync::atomic::Ordering::Relaxed);
+    // 节流 700ms（读上次检测时刻，不写入——由 dodge_if_occluding 统一记账）
+    let now = START_MS
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as usize;
+    let last = DODGE_LAST_CHECK_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(last) > 700 {
+        let hwnd = TOPMOST_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        if hwnd != 0 {
+            PostMessageW(
+                Some(HWND(hwnd as _)),
+                WM_APP_DODGE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
 }
 
 unsafe extern "system" fn foreground_hook(
@@ -1500,11 +2230,13 @@ unsafe extern "system" fn wndproc(
                     id if (MENU_CAPSULE_BASE..MENU_CAPSULE_BASE + 9).contains(&id) => {
                         let bit = 1u32 << (id - MENU_CAPSULE_BASE);
                         (*ptr).capsule_items ^= bit;
+                        (*ptr).widest = 0;
                         save_config(&(*ptr).as_config());
                     }
                     id if (MENU_ROW_BASE..MENU_ROW_BASE + 5).contains(&id) => {
                         let bit = 1u32 << (id - MENU_ROW_BASE);
                         (*ptr).row_items ^= bit;
+                        (*ptr).widest = 0;
                         save_config(&(*ptr).as_config());
                     }
                     id if (MENU_ROTATE_BASE..MENU_ROTATE_BASE + 4).contains(&id) => {
@@ -1519,6 +2251,13 @@ unsafe extern "system" fn wndproc(
                     id if (MENU_REFRESH_BASE..MENU_REFRESH_BASE + 3).contains(&id) => {
                         (*ptr).refresh_ms = REFRESH_CHOICES_MS[id - MENU_REFRESH_BASE];
                         SetTimer(Some(hwnd), TIMER_ID, (*ptr).refresh_ms, None);
+                        save_config(&(*ptr).as_config());
+                    }
+                    id if (MENU_DODGE_BASE..MENU_DODGE_BASE + DODGE_CHOICES_SECS.len())
+                        .contains(&id) =>
+                    {
+                        (*ptr).dodge_secs = DODGE_CHOICES_SECS[id - MENU_DODGE_BASE];
+                        (*ptr).last_dodge = None; // 立即按新周期执行一次检测
                         save_config(&(*ptr).as_config());
                     }
                     _ => {}
@@ -1537,12 +2276,20 @@ unsafe extern "system" fn wndproc(
                 (*ptr).dragging = false;
                 (*ptr).save_current_pos();
                 let _ = (*ptr).tick();
+                (*ptr).dodge_if_occluding();
             }
             LRESULT(0)
         }
         WM_APP_CTRL => {
             if let Some(ptr) = non_null_app(hwnd) {
                 let _ = (*ptr).update_clickthrough();
+            }
+            LRESULT(0)
+        }
+        WM_APP_DODGE => {
+            // 窗口事件钩子触发的即时检测（已在钩子中节流）
+            if let Some(ptr) = non_null_app(hwnd) {
+                (*ptr).dodge_if_occluding();
             }
             LRESULT(0)
         }
@@ -1563,6 +2310,16 @@ unsafe extern "system" fn wndproc(
                 let ptr = app_ptr(hwnd);
                 if !ptr.is_null() {
                     let _ = (*ptr).tick();
+                }
+            } else if wparam.0 == DODGE_TIMER_ID {
+                let ptr = app_ptr(hwnd);
+                if !ptr.is_null() {
+                    (*ptr).fade_step();
+                }
+            } else if wparam.0 == CAP_TIMER_ID {
+                let ptr = app_ptr(hwnd);
+                if !ptr.is_null() {
+                    (*ptr).capture_timer_step();
                 }
             }
             LRESULT(0)
