@@ -78,6 +78,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 const TIMER_ID: usize = 1;
 const DODGE_TIMER_ID: usize = 2;
 const CAP_TIMER_ID: usize = 3;
+const DODGE_RETRY_TIMER_ID: usize = 4;
+// 事件节流窗口：窗口动画期间的事件风暴合并为一次检测
+const DODGE_THROTTLE_MS: usize = 300;
+// 兜底轮询周期：即使没有任何窗口事件也定期查一次（后台窗口内容变化等场景）
+const DODGE_SWEEP_MS: usize = 2500;
 // 排除标志生效到截屏之间的等待（定时器，不阻塞 UI 线程）
 const CAP_CAPTURE_DELAY_MS: u32 = 45;
 // 检测上下文：请求阶段计算一次，截屏回调中复用
@@ -698,7 +703,8 @@ impl App {
 
         // 事件驱动防遮挡（dodge_secs>0 时启用）：
         // 其他窗口移动/显示/隐藏/前台切换，或自身宽度变化（翻页/形态切换）时立即检测；
-        // 屏幕无变化则零轮询。last_dodge 为避让后的防震荡冷却（未来时刻）
+        // 另加 2.5s 兜底轮询：覆盖不产生窗口事件的场景（后台窗口加载内容、
+        // 非激活窗口还原/变化等）。last_dodge 为避让后的防震荡冷却（未来时刻）
         if self.dodge_secs > 0 {
             let event = DODGE_EVENT.swap(false, std::sync::atomic::Ordering::Relaxed);
             let mut width_changed = false;
@@ -709,7 +715,13 @@ impl App {
                     width_changed = true;
                 }
             }
-            if event || width_changed {
+            let now_ms = START_MS
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_millis() as usize;
+            let stale = now_ms.saturating_sub(DODGE_LAST_CHECK_MS.load(std::sync::atomic::Ordering::Relaxed))
+                >= DODGE_SWEEP_MS;
+            if event || width_changed || stale {
                 self.dodge_if_occluding();
             }
         }
@@ -1465,7 +1477,7 @@ impl App {
             .elapsed()
             .as_millis() as usize;
         if now_ms.saturating_sub(DODGE_LAST_CHECK_MS.load(std::sync::atomic::Ordering::Relaxed))
-            < 700
+            < DODGE_THROTTLE_MS
         {
             return;
         }
@@ -2159,7 +2171,7 @@ unsafe extern "system" fn dodge_event_hook(
         .elapsed()
         .as_millis() as usize;
     let last = DODGE_LAST_CHECK_MS.load(std::sync::atomic::Ordering::Relaxed);
-    if now.saturating_sub(last) > 700 {
+    if now.saturating_sub(last) > DODGE_THROTTLE_MS {
         let hwnd = TOPMOST_HWND.load(std::sync::atomic::Ordering::Relaxed);
         if hwnd != 0 {
             PostMessageW(
@@ -2168,6 +2180,14 @@ unsafe extern "system" fn dodge_event_hook(
                 WPARAM(0),
                 LPARAM(0),
             );
+        }
+    } else {
+        // 节流窗口内：安排一个到期即查的重试定时器，避免被动等下一次
+        // 刷新 tick（最长 refresh_ms）才消费事件
+        let hwnd = TOPMOST_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        if hwnd != 0 {
+            let remain = (DODGE_THROTTLE_MS - (now - last)) as u32 + 10;
+            let _ = SetTimer(Some(HWND(hwnd as _)), DODGE_RETRY_TIMER_ID, remain, None);
         }
     }
 }
@@ -2409,6 +2429,12 @@ unsafe extern "system" fn wndproc(
                 let ptr = app_ptr(hwnd);
                 if !ptr.is_null() {
                     (*ptr).capture_timer_step();
+                }
+            } else if wparam.0 == DODGE_RETRY_TIMER_ID {
+                let _ = KillTimer(Some(hwnd), DODGE_RETRY_TIMER_ID);
+                let ptr = app_ptr(hwnd);
+                if !ptr.is_null() {
+                    (*ptr).dodge_if_occluding();
                 }
             }
             LRESULT(0)
