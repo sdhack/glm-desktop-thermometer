@@ -95,14 +95,14 @@ dependencies = [
 
 [[package]]
 name = "tempmon-sensor"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "windows",
 ]
 
 [[package]]
 name = "tempmon-ui"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "tempmon-sensor",
  "windows",
