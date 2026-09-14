@@ -570,6 +570,16 @@ pub fn sensor_loop() {
                 eprintln!("[sensor] frame {frame_no} sample {:.1}s", dt.as_secs_f32());
             }
             write_frame(view.Value as *mut u8, &snap);
+            // 周期性工作集修剪（约每 10 分钟）：冷页换出，占用保持低位
+            if frame_no % 600 == 0 {
+                use windows::Win32::System::Threading::{
+                    GetCurrentProcess, SetProcessWorkingSetSize,
+                };
+                use windows::Win32::Foundation::HANDLE;
+                unsafe {
+                    let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+                }
+            }
             // 刷新间隔跟配置走（UI 菜单可调，写回 tempmon.conf 的 refresh= 行）
             let ms = std::fs::read_to_string(config_refresh_ms())
                 .ok()

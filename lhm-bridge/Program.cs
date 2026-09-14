@@ -2,9 +2,10 @@ using LibreHardwareMonitor.Hardware;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 
-// 无窗后台桥：枚举 CPU 温度与全部风扇转速，每 2 秒向标准输出打印一行协议文本。
+// 无窗后台桥：枚举 CPU 温度与全部风扇转速，每 1 秒向标准输出打印一行协议文本。
 // 行格式：CPU_TEMP <摄氏度> | FAN <名称> <rpm>（多条）| END
 // 由 tempmon 采集子进程拉起并解析；本进程崩溃会被自动重启。
 
@@ -20,9 +21,15 @@ var computer = new Computer
 };
 computer.Open();
 
+// 周期性工作集修剪：后台无窗采集器没有前台体验负担，
+// 让 OS 把冷页换出，任务管理器里的占用常年保持低位
+Native.TrimWorkingSet();
+
 var stdout = Console.Out;
+var sinceTrim = 0;
 while (true)
 {
+    sinceTrim++;
     try
     {
         foreach (IHardware hw in computer.Hardware)
@@ -71,6 +78,12 @@ while (true)
     {
         stdout.WriteLine("END"); // 出错也输出 END，避免读取端阻塞
     }
+    if (sinceTrim % 600 == 0)
+    {
+        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        GC.WaitForPendingFinalizers();
+        Native.TrimWorkingSet();
+    }
     Thread.Sleep(1000);
 }
 
@@ -81,4 +94,13 @@ static void CollectFans(IHardware hw, List<(string, float)> fans)
         if (s.SensorType == SensorType.Fan && s.Value.HasValue && s.Value.Value > 0)
             fans.Add((hw.Name + "/" + s.Name, s.Value.Value));
     }
+}
+
+static class Native
+{
+    [DllImport("kernel32.dll")]
+    internal static extern bool SetProcessWorkingSetSize(IntPtr hProc, IntPtr min, IntPtr max);
+    [DllImport("kernel32.dll")]
+    internal static extern IntPtr GetCurrentProcess();
+    internal static void TrimWorkingSet() => SetProcessWorkingSetSize(GetCurrentProcess(), (IntPtr)(-1), (IntPtr)(-1));
 }

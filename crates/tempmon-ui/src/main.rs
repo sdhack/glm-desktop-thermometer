@@ -285,6 +285,7 @@ struct App {
     bg_mode: u8,
     click_pos: Option<POINT>,
     clickthrough_state: bool,
+    trim_tick: u32,
     h_gpu_usage: Hold,
     h_gpu_vram: Hold,
     h_gpu_temp: Hold,
@@ -634,6 +635,7 @@ impl App {
                 bg_mode: cfg.bg_mode,
                 click_pos: None,
                 clickthrough_state: true,
+                trim_tick: 540,
                 h_gpu_usage: Hold::default(),
                 h_gpu_vram: Hold::default(),
                 h_gpu_temp: Hold::default(),
@@ -766,6 +768,20 @@ impl App {
         }
         self.update_clickthrough();
         self.ensure_sensor_alive();
+
+        // 周期性工作集修剪（约每 10 分钟）：让 OS 换出冷页，
+        // 任务管理器占用常年保持低位；悬停/拖拽期间跳过避免微小卡顿
+        self.trim_tick += 1;
+        if self.trim_tick >= 600 && self.clickthrough_state && !self.dragging {
+            self.trim_tick = 0;
+            unsafe {
+                let _ = windows::Win32::System::Threading::SetProcessWorkingSetSize(
+                    windows::Win32::System::Threading::GetCurrentProcess(),
+                    usize::MAX,
+                    usize::MAX,
+                );
+            }
+        }
 
         // 事件驱动防遮挡（dodge_secs>0 时启用）：
         // 其他窗口移动/显示/隐藏/前台切换，或自身宽度变化（翻页/形态切换）时立即检测；
