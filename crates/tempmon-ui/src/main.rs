@@ -250,6 +250,7 @@ struct App {
     hbmp_old: HGDIOBJ,
     buf_w: i32,
     buf_h: i32,
+    dwm_round_ok: bool,
 }
 
 // ── 配置持久化 ──
@@ -388,19 +389,24 @@ fn main() -> windows::core::Result<()> {
         let ptr = Box::into_raw(app);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
 
-        // 圆角：毛玻璃用 DWM 系统圆角（雾面层一起圆）；普通用区域裁剪（rgn 窗口无投影）
+        // 圆角：毛玻璃优先用 DWM 系统圆角（仅 Win11 支持）；失败（Win10/旧系统）
+        // 回退到区域裁剪（rgn 窗口无投影），否则毛玻璃层会是直角
+        let mut dwm_round_ok = false;
         if bg_mode0 >= 2 {
             let pref = windows::Win32::Graphics::Dwm::DWMWCP_ROUND;
-            let _ = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+            let hr = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
                 hwnd,
                 windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(33),
                 &pref as *const _ as *const core::ffi::c_void,
                 4,
             );
-        } else {
+            dwm_round_ok = hr.is_ok();
+        }
+        if !dwm_round_ok {
             let rgn = CreateRoundRectRgn(0, 0, 421, 41, 16, 16);
             let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, Some(rgn), true);
         }
+        (*ptr).dwm_round_ok = dwm_round_ok;
         (*ptr).apply_bg_effect();
 
         TOPMOST_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
@@ -530,8 +536,9 @@ impl App {
                 dc_mem: HDC::default(),
                 hbmp: None,
                 hbmp_old: HGDIOBJ::default(),
-                buf_w: 0,
-                buf_h: 0,
+        buf_w: 0,
+        buf_h: 0,
+        dwm_round_ok: false,
             };
             app.ensure_sensor_alive();
             Ok(app)
@@ -941,7 +948,8 @@ impl App {
                 &bg,
             );
 
-            if self.bg_mode < 2 {
+            // 普通模式或 DWM 圆角不可用（Win10 毛玻璃）时，用区域裁剪保持圆角
+            if self.bg_mode < 2 || !self.dwm_round_ok {
                 let rgn = CreateRoundRectRgn(
                     0,
                     0,
@@ -1217,6 +1225,10 @@ impl App {
         unsafe {
             let acrylic = self.bg_mode >= 2;
             apply_acrylic(self.hwnd, acrylic, self.bg_mode == 3);
+            // 从普通模式切回毛玻璃时清除区域裁剪，交给 DWM 系统圆角
+            if acrylic && self.dwm_round_ok {
+                let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(self.hwnd, None, true);
+            }
         }
     }
 
