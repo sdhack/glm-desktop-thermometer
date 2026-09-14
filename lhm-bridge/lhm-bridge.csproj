@@ -4,7 +4,7 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>disable</Nullable>
     <AssemblyName>lhm-bridge</AssemblyName>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
     <InvariantGlobalization>true</InvariantGlobalization>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>false</SelfContained>

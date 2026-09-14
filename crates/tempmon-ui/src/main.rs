@@ -1433,6 +1433,25 @@ impl App {
         if self.dragging || self.hidden || self.dodging || !self.rendered_once {
             return;
         }
+        // 编辑态（按住 Ctrl）或光标正在靠近时暂停避让——别躲着用户跑
+        if !self.clickthrough_state {
+            return;
+        }
+        unsafe {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let mut r = RECT::default();
+            if GetWindowRect(self.hwnd, &mut r).is_ok() {
+                let pad = 40;
+                if pt.x >= r.left - pad
+                    && pt.x <= r.right + pad
+                    && pt.y >= r.top - pad
+                    && pt.y <= r.bottom + pad
+                {
+                    return;
+                }
+            }
+        }
         if self.cap.is_some() {
             return; // 上一次截取尚未完成
         }
