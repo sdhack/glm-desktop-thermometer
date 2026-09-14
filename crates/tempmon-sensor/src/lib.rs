@@ -614,12 +614,37 @@ fn query_disk_temps() -> Option<Vec<f32>> {
 type LhmData = (Option<f32>, Vec<f32>);
 static LHM_CACHE: std::sync::Mutex<LhmData> = std::sync::Mutex::new((None, Vec::new()));
 
-/// 启动桥接读取线程；桥接进程退出（崩溃/被杀）后 5 秒自动重启
+/// 启动桥接读取线程；桥接进程退出（崩溃/被杀）后 5 秒自动重启。
+/// 桥接挂进本进程的 KILL_ON_JOB_CLOSE Job：本进程（sensor）被 UI 杀掉重启时，
+/// 孤儿桥接随之退出，不再堆积。
 pub fn spawn_lhm_bridge() {
-    std::thread::spawn(|| loop {
-        let _ = run_bridge_once();
-        std::thread::sleep(std::time::Duration::from_secs(5));
+    std::thread::spawn(move || {
+        let job = create_bridge_job();
+        loop {
+            let _ = run_bridge_once(job);
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
     });
+}
+
+fn create_bridge_job() -> windows::Win32::Foundation::HANDLE {
+    use windows::Win32::System::JobObjects::{
+        CreateJobObjectW, SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JobObjectExtendedLimitInformation,
+    };
+    unsafe {
+        let job = CreateJobObjectW(None, PCWSTR::null()).expect("create bridge job");
+        let mut info = zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as _,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+        .expect("set bridge job limit");
+        job
+    }
 }
 
 fn bridge_exe_path() -> Option<std::path::PathBuf> {
@@ -634,9 +659,11 @@ fn bridge_exe_path() -> Option<std::path::PathBuf> {
     }
 }
 
-fn run_bridge_once() -> Option<()> {
+fn run_bridge_once(job: windows::Win32::Foundation::HANDLE) -> Option<()> {
     use std::io::BufRead;
     use std::os::windows::process::CommandExt;
+    use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+    use windows::Win32::Foundation::HANDLE;
     let exe = bridge_exe_path()?;
     let mut child = std::process::Command::new(exe)
         .stdout(std::process::Stdio::piped())
@@ -644,7 +671,19 @@ fn run_bridge_once() -> Option<()> {
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .spawn()
         .ok()?;
-    let stdout = child.stdout.take()?;
+    // 挂入 Job：本进程意外退出时桥接一并终止
+    unsafe {
+        use std::os::windows::io::AsRawHandle;
+        let _ = AssignProcessToJobObject(job, HANDLE(child.as_raw_handle() as _));
+    }
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
     let reader = std::io::BufReader::new(stdout);
     let mut cpu_temp = None;
     let mut fans: Vec<f32> = Vec::new();
