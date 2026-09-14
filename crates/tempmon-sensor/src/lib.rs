@@ -547,11 +547,28 @@ pub fn sensor_loop() {
         .expect("create file mapping");
         let view = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, frame_len());
         assert!(!view.Value.is_null(), "map view failed");
+        let debug = std::env::var("TEMPMON_SENSOR_DEBUG").is_ok();
+        if debug {
+            eprintln!("[sensor] mapping ok pid={}", std::process::id());
+        }
         let mut hub = SensorHub::new();
+        if debug {
+            eprintln!("[sensor] hub ok");
+        }
         spawn_disk_poller();
         spawn_lhm_bridge();
+        if debug {
+            eprintln!("[sensor] loop enter");
+        }
+        let mut frame_no: u32 = 0;
         loop {
+            let t0 = std::time::Instant::now();
             let snap = hub.sample();
+            let dt = t0.elapsed();
+            frame_no += 1;
+            if debug && (frame_no <= 3 || dt > std::time::Duration::from_millis(1500)) {
+                eprintln!("[sensor] frame {frame_no} sample {:.1}s", dt.as_secs_f32());
+            }
             write_frame(view.Value as *mut u8, &snap);
             // 刷新间隔跟配置走（UI 菜单可调，写回 tempmon.conf 的 refresh= 行）
             let ms = std::fs::read_to_string(config_refresh_ms())

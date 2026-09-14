@@ -268,7 +268,8 @@ struct App {
     view: *const u8,
     child: Option<Child>,
     last_seq: u32,
-    stale_ticks: u32,
+    last_seq_change: Option<Instant>,
+    child_spawned_at: Option<Instant>,
     child_produced: bool,
     respawn_streak: u32,
     respawn_not_before: Option<Instant>,
@@ -616,7 +617,8 @@ impl App {
                 view: view_ptr.Value as *const u8,
                 child: None,
                 last_seq: 0,
-                stale_ticks: 99,
+                last_seq_change: None,
+                child_spawned_at: None,
                 child_produced: false,
                 respawn_streak: 0,
                 respawn_not_before: None,
@@ -682,24 +684,39 @@ impl App {
                 return;
             }
         }
-        let stale = if self.view.is_null() {
+        // 卡死判定用真实时间而非 tick 计数：避让淡入淡出每 16ms 手动调一次
+        // tick，按计数会把一帧的正常等待（1s）误判成 6 次卡死，导致每次
+        // 避让都杀掉并重拉 sensor（也是当年孤儿 bridge 泄漏的总根源）
+        let stale = if self.view.is_null() || self.child.is_none() {
+            // 首次拉起，或上一只子进程已确认死亡
             true
         } else {
             let seq = frame_seq(self.view);
             if seq != self.last_seq {
                 self.child_produced = true;
+                self.last_seq_change = Some(Instant::now());
+                self.last_seq = seq;
             }
-            let s = if seq == self.last_seq {
-                self.stale_ticks + 1
-            } else {
-                0
-            };
-            self.last_seq = seq;
-            self.stale_ticks = s;
-            self.stale_ticks > 5
+            match self.last_seq_change {
+                // 出过帧后帧间隔超 8s 判卡死；从未出帧则等 20s（冷启动余量）
+                Some(t) => t.elapsed() > std::time::Duration::from_secs(8),
+                None => self
+                    .child_spawned_at
+                    .is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(20)),
+            }
         };
         if !stale {
             return;
+        }
+        if self.debug_on() {
+            eprintln!(
+                "[sensor-watch] stale at +{:.1}s: frozen_for={:?} last_seq={} produced={} streak={}",
+                (Instant::now() - self.started_at).as_secs_f32(),
+                self.last_seq_change.map(|t| t.elapsed()),
+                self.last_seq,
+                self.child_produced,
+                self.respawn_streak,
+            );
         }
         if let Some(mut old) = self.child.take() {
             let _ = old.kill();
@@ -711,19 +728,27 @@ impl App {
             self.respawn_streak = (self.respawn_streak + 1).min(5);
         }
         if let Ok(exe) = std::env::current_exe() {
-            if let Ok(child) = std::process::Command::new(exe)
+            match std::process::Command::new(exe)
                 .env("TEMPMON_SENSOR", "1")
                 .creation_flags(0x0800_0000)
                 .spawn()
             {
-                unsafe {
-                    let _ = AssignProcessToJobObject(self.job, HANDLE(child.as_raw_handle() as _));
+                Ok(child) => {
+                    unsafe {
+                        let _ = AssignProcessToJobObject(self.job, HANDLE(child.as_raw_handle() as _));
+                    }
+                    self.child = Some(child);
+                    self.child_spawned_at = Some(Instant::now());
+                    self.child_produced = false;
                 }
-                self.child = Some(child);
-                self.child_produced = false;
-                let delay = std::time::Duration::from_secs(6 << self.respawn_streak.min(4));
-                self.respawn_not_before = Some(Instant::now() + delay);
+                Err(e) => {
+                    if self.debug_on() {
+                        eprintln!("[sensor-watch] spawn FAILED: {e}");
+                    }
+                }
             }
+            let delay = std::time::Duration::from_secs(6 << self.respawn_streak.min(4));
+            self.respawn_not_before = Some(Instant::now() + delay);
         }
     }
 
