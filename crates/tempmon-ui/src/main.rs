@@ -311,6 +311,7 @@ struct App {
     dctx: Option<DodgeCtx>,
     fb_x: i32,
     fb_d: f32,
+    fb_runs: u32,
 }
 
 // ── 配置持久化 ──
@@ -638,6 +639,7 @@ impl App {
         dctx: None,
         fb_x: 0,
         fb_d: 0.0,
+        fb_runs: 0,
             };
             app.ensure_sensor_alive();
             Ok(app)
@@ -1549,6 +1551,7 @@ impl App {
             let has = has || cap_hit;
             if in_bounds && !has {
                 self.dctx = None;
+                self.fb_runs = 0;
                 return; // 常态：无遮挡
             }
             // 确认遮挡（或超界）：固定当前位置（此后左缘锚定向右伸展），整行截取
@@ -1564,12 +1567,24 @@ impl App {
         // 第二阶段：整行边缘图上选新位置
         let Some(ctx) = self.dctx else { return };
         let (strip_w, h, max_w) = (req.w as usize, req.h as usize, ctx.max_w);
+        // 内容遮挡 + 标题栏按钮区（避免挪到的新位置又压住按钮）
         let occ = |x: i32| -> bool {
             let ox = (x - ctx.wa.left) as usize;
             if ox + max_w as usize > strip_w {
                 return true; // 越界视为有遮挡
             }
-            edge_region_has_content(&edge, strip_w, h, ox, max_w as usize)
+            if edge_region_has_content(&edge, strip_w, h, ox, max_w as usize) {
+                return true;
+            }
+            let mut sx = x + max_w - 8;
+            let sy = ctx.y + ctx.h / 2;
+            while sx >= x {
+                if caption_zone_hit(sx, sy) {
+                    return true;
+                }
+                sx -= 24;
+            }
+            false
         };
         if dump {
             let mut cand_log = String::new();
@@ -1639,6 +1654,10 @@ impl App {
         // 都没有空位：退而求其次，选遮挡密度最小的候选。
         // 双重防震荡：①候选密度必须比当前位置低 0.01 以上（明显更优才挪）；
         // ②已在兜底位且密度未明显上升（内容没变化）时留在原地
+        // 连续 3 次兜底移动仍没找到真正空位 → 强制长冷却，打破循环
+        if target.is_none() && self.fb_runs >= 3 {
+            return;
+        }
         if target.is_none() && self.last_dodge.map_or(true, |t| t <= Instant::now()) {
             let cur_d = edge_region_stats(
                 &edge,
@@ -1679,10 +1698,16 @@ impl App {
 
         // 确定目标位置后，淡出→挪过去→淡入
         if let Some(nx) = target {
+            // 兜底移动（无空位时）计入连击，冷却拉长到 30 秒打破循环
+            let fallback = evaluated.iter().all(|(_, o, _)| *o);
+            self.fb_runs = if fallback { self.fb_runs + 1 } else { 0 };
             self.fade_x = nx;
             self.fade_y = ctx.y;
             self.dodging = true;
             self.fade_phase = 1;
+            if fallback && self.fb_runs >= 3 {
+                self.last_dodge = Some(Instant::now() + std::time::Duration::from_secs(26));
+            }
             let _ = SetTimer(Some(self.hwnd), DODGE_TIMER_ID, DODGE_TIMER_MS, None);
         }
     }
