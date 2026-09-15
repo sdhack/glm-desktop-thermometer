@@ -105,6 +105,8 @@ struct CapReq {
     w: i32,
     h: i32,
     full: bool,
+    /// true = 标题栏同步截取（右缘按钮条带，只做行密度分析）
+    sync: bool,
     excluded: bool,
     hidden: bool,
 }
@@ -327,6 +329,7 @@ struct App {
     fb_x: i32,
     free_streak: u32,
     ret_cooldown_until: Option<Instant>,
+    last_sync_check: Option<Instant>,
     fb_d: f32,
     fb_runs: u32,
 }
@@ -683,6 +686,7 @@ impl App {
         fb_x: 0,
         free_streak: 0,
         ret_cooldown_until: None,
+        last_sync_check: None,
         fb_d: 0.0,
         fb_runs: 0,
             };
@@ -1558,11 +1562,26 @@ impl App {
                     return;
                 }
             }
-            // 标题栏垂直同步：非手动钉住时，让温度计与宿主窗口的标题栏按钮行
-            // 保持同一高度（不同软件的标题栏高度不同，用 DWM 按钮边界自适应）。
-            // 挪动后直接返回，下一轮再做遮挡检测
-            if !self.user_pinned && self.sync_title_bar_height() {
-                return;
+            // 标题栏高度同步（截图判定）：每 ≥10s 截一次右上角 200×48 条带，
+            // 分析按钮/图标边缘行的垂直中心，把温度计对齐过去。手动拖拽
+            // 钉住的位置不参与
+            if !self.user_pinned
+                && self
+                    .last_sync_check
+                    .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10))
+                && !self.cap.is_some()
+            {
+                self.last_sync_check = Some(Instant::now());
+                let mut wa0 = RECT::default();
+                let _ = SystemParametersInfoW(
+                    SPI_GETWORKAREA,
+                    0,
+                    Some(&mut wa0 as *mut RECT as _),
+                    windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+                );
+                if self.begin_capture(wa0.right - 200, wa0.top, 200, 48, false, true) {
+                    return;
+                }
             }
         }
         if self.cap.is_some() {
@@ -1611,7 +1630,7 @@ impl App {
                 return;
             }
             self.dctx = Some(DodgeCtx { x0, y, h, max_w, cur_w, left0, wa, ret_right: false });
-            if !self.begin_capture(cx, y, cw, h, false) {
+            if !self.begin_capture(cx, y, cw, h, false, false) {
                 self.dctx = None;
             }
         }
@@ -1619,104 +1638,6 @@ impl App {
 
     fn debug_on(&self) -> bool {
         std::env::var("TEMPMON_DODGE_DEBUG").is_ok()
-    }
-
-    /// 标题栏垂直同步：取温度计中点下方的宿主窗口（自身穿透，WindowFromPoint
-    /// 会跳过自己），用 DWMWA_CAPTION_BUTTON_BOUNDS 拿到标题栏按钮的真实位置，
-    /// 让温度计垂直居中对齐按钮行。宿主是桌面/任务栏（过滤类名）或拿不到按钮
-    /// 边界时不动作。返回 true 表示已发起移动。
-    unsafe fn sync_title_bar_height(&mut self) -> bool {
-        use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
-        use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor};
-        let mut r = RECT::default();
-        if GetWindowRect(self.hwnd, &mut r).is_err() {
-            return false;
-        }
-        let cx = (r.left + r.right) / 2;
-        let cy = r.top + 12;
-        // WindowFromPoint 常返回内容子窗口（如 Edge 的
-        // Chrome_RenderWidgetHostHWND），取 GA_ROOT 得到真正的顶层窗口
-        let host = WindowFromPoint(POINT { x: cx, y: cy });
-        let host = if host.is_invalid() {
-            host
-        } else {
-            GetAncestor(host, GA_ROOT)
-        };
-        let dump0 = std::env::var("TEMPMON_DODGE_DEBUG").is_ok();
-        if dump0 {
-            let mut c0 = [0u16; 64];
-            let n0 = if host.is_invalid() { 0 } else { GetClassNameW(host, &mut c0) };
-            eprintln!(
-                "[title-sync] entry cx={} cy={} host_invalid={} cls={}",
-                cx,
-                cy,
-                host.is_invalid(),
-                String::from_utf16_lossy(&c0[..n0 as usize])
-            );
-        }
-        if host.is_invalid() || host == self.hwnd {
-            return false;
-        }
-        let mut cls = [0u16; 64];
-        let n = GetClassNameW(host, &mut cls);
-        let cls = String::from_utf16_lossy(&cls[..n as usize]);
-        if matches!(
-            cls.as_str(),
-            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
-        ) {
-            return false; // 桌面/任务栏：保持当前位置
-        }
-        // 可见上缘（EXTENDED_FRAME_BOUNDS 去掉不可见边框）+ Win11 标题栏
-        // 按钮标准中心 24px。不用 DWMWA_CAPTION_BUTTON_BOUNDS：Edge/Chrome
-        // 等自绘标题栏窗口的该值覆盖整个标签条，明显偏离真实按钮位置
-        let mut efb = RECT::default();
-        let vis_top = if DwmGetWindowAttribute(
-            host,
-            windows::Win32::Graphics::Dwm::DWMWA_EXTENDED_FRAME_BOUNDS,
-            &mut efb as *mut RECT as *mut core::ffi::c_void,
-            std::mem::size_of::<RECT>() as u32,
-        )
-        .is_ok()
-            && efb.bottom > efb.top
-        {
-            efb.top
-        } else {
-            return false;
-        };
-        // 按钮行的屏幕绝对中心；温度计上下居中对齐
-        let btn_center = vis_top + 24;
-        let h = r.bottom - r.top;
-        let mut wa = RECT::default();
-        let _ = SystemParametersInfoW(
-            SPI_GETWORKAREA,
-            0,
-            Some(&mut wa as *mut RECT as _),
-            windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        );
-        let ty = (btn_center - h / 2).max(wa.top);
-        let dump = std::env::var("TEMPMON_DODGE_DEBUG").is_ok();
-        if dump {
-            eprintln!(
-                "[title-sync] host={} vis_top={} h={} cur_y={} -> ty={} (d={})",
-                cls,
-                vis_top,
-                h,
-                r.top,
-                ty,
-                ty - r.top
-            );
-        }
-        if (ty - r.top).abs() <= 3 {
-            return false; // 已对齐（±3px 内不动）
-        }
-        self.pos = Some(POINT { x: r.left, y: ty });
-        self.fade_x = r.left;
-        self.fade_y = ty;
-        self.dodging = true;
-        self.fade_phase = 1;
-        self.ret_cooldown_until = Some(Instant::now() + std::time::Duration::from_secs(10));
-        let _ = SetTimer(Some(self.hwnd), DODGE_TIMER_ID, DODGE_TIMER_MS, None);
-        true
     }
 
     /// 截屏定时器回调：执行截屏（毫秒级）并根据阶段继续流程
@@ -1749,6 +1670,10 @@ impl App {
             let _ = std::fs::write(format!("D:/GLM桌面温度计260912/tools/{}", name), &data);
         }
         let Some(edge) = compute_edge_map(&px, req.w as usize, req.h as usize) else { return };
+        if req.sync {
+            self.title_sync_from_strip(&edge, &req);
+            return;
+        }
         if !req.full {
             // 第一阶段：当前占位是否压住内容；边界超界也进入重选流程
             let Some(ctx) = self.dctx else { return };
@@ -1799,7 +1724,7 @@ impl App {
                     self.dctx = Some(DodgeCtx { ret_right: true, ..ctx });
                     let strip_x = ctx.wa.left;
                     let strip_w = ctx.wa.right - ctx.wa.left;
-                    if self.begin_capture(strip_x, ctx.y, strip_w, ctx.h, true) {
+                    if self.begin_capture(strip_x, ctx.y, strip_w, ctx.h, true, false) {
                         return;
                     }
                 }
@@ -1811,7 +1736,7 @@ impl App {
             self.pos = Some(POINT { x: ctx.x0, y: ctx.y });
             let strip_x = ctx.wa.left;
             let strip_w = ctx.wa.right - ctx.wa.left;
-            if !self.begin_capture(strip_x, ctx.y, strip_w, ctx.h, true) {
+            if !self.begin_capture(strip_x, ctx.y, strip_w, ctx.h, true, false) {
                 self.dctx = None;
             }
             return;
@@ -1992,8 +1917,88 @@ impl App {
         }
     }
 
+    /// 从右缘条带（200×48）的边缘图判定标题栏按钮行的垂直中心并同步。
+    /// 按钮行表现为一条水平密集带；取带中心，把温度计垂直居中对齐过去。
+    /// 只在明显偏移（>3px）时移动；移动后 10s 内不重复同步
+    fn title_sync_from_strip(&mut self, edge: &[u8], req: &CapReq) {
+        let w = req.w as usize;
+        let h = req.h as usize;
+        if w < 16 || h < 16 {
+            return;
+        }
+        let mut row_density = vec![0f32; h];
+        for y in 1..h - 1 {
+            let mut c = 0u32;
+            for x in 1..w - 1 {
+                c += edge[y * w + x] as u32;
+            }
+            row_density[y] = c as f32 / (w - 2) as f32;
+        }
+        // 按钮带：从第一处密度 >0.05 的行起，容忍 ≤4 行稀疏，延伸到带尾
+        let mut start = None;
+        for y in 0..h {
+            if row_density[y] > 0.05 {
+                start = Some(y);
+                break;
+            }
+        }
+        let Some(s0) = start else {
+            if self.debug_on() {
+                eprintln!("[title-sync] strip has no content rows");
+            }
+            return;
+        };
+        let mut end = s0;
+        let mut gap = 0usize;
+        for y in s0..h {
+            if row_density[y] > 0.04 {
+                end = y;
+                gap = 0;
+            } else {
+                gap += 1;
+                if gap > 4 {
+                    break;
+                }
+            }
+        }
+        let center = req.y + ((s0 + end) / 2) as i32;
+        unsafe {
+            let mut r = RECT::default();
+            if GetWindowRect(self.hwnd, &mut r).is_err() {
+                return;
+            }
+            let mut wa = RECT::default();
+            let _ = SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some(&mut wa as *mut RECT as _),
+                windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            );
+            let h_w = r.bottom - r.top;
+            let ty = (center - h_w / 2).max(wa.top);
+            let d = ty - r.top;
+            if self.debug_on() {
+                eprintln!(
+                    "[title-sync] band=({s0},{end}) center={center} h={h_w} cur_y={} ty={ty} d={d}",
+                    r.top
+                );
+            }
+            if d.abs() <= 3 {
+                return;
+            }
+            self.pos = Some(POINT { x: r.left, y: ty });
+            self.fade_x = r.left;
+            self.fade_y = ty;
+            self.dodging = true;
+            self.fade_phase = 1;
+            self.ret_cooldown_until =
+                Some(Instant::now() + std::time::Duration::from_secs(10));
+            let _ = SetTimer(Some(self.hwnd), DODGE_TIMER_ID, DODGE_TIMER_MS, None);
+        }
+    }
+
     /// 发起截屏：设置截图排除（瞬时，不阻塞），实际截屏在定时器回调中执行
-    unsafe fn begin_capture(&mut self, x: i32, y: i32, w: i32, h: i32, full: bool) -> bool {
+    unsafe fn begin_capture(&mut self, x: i32, y: i32, w: i32, h: i32, full: bool, sync: bool) -> bool {
         if w <= 0 || h <= 0 || self.cap.is_some() {
             return false;
         }
@@ -2004,7 +2009,7 @@ impl App {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
             hidden = true;
         }
-        self.cap = Some(CapReq { x, y, w, h, full, excluded, hidden });
+        self.cap = Some(CapReq { x, y, w, h, full, sync, excluded, hidden });
         let _ = SetTimer(Some(self.hwnd), CAP_TIMER_ID, CAP_CAPTURE_DELAY_MS, None);
         true
     }
