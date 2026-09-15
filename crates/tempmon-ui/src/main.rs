@@ -1849,11 +1849,12 @@ impl App {
             return;
         }
 
-        // 第一优先：右侧最近空位；其次：左侧最近空位
+        // 靠右原则：有空位就取**最靠右**的完全空位（不再就近）
         let mut target = evaluated
             .iter()
-            .find(|(_, occupied, _)| !occupied)
-            .map(|&(nx, _, _)| nx);
+            .filter(|(_, occupied, _)| !occupied)
+            .map(|&(nx, _, _)| nx)
+            .max();
         if target.is_some() {
             self.fb_x = 0;
         }
@@ -1881,10 +1882,12 @@ impl App {
             if self.fb_x != 0 && ctx.left0 == self.fb_x && cur_d <= self.fb_d + 0.015 {
                 return;
             }
+            // 靠右原则兜底：在遮挡明显更少的候选里取**最靠右**的，
+            // 绝不往左边跑
             target = evaluated
                 .iter()
                 .filter(|(_, _, d)| *d < cur_d - 0.01)
-                .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|a, b| a.0.cmp(&b.0))
                 .map(|&(nx, _, _)| nx);
             if let Some(nx) = target {
                 self.fb_x = nx;
