@@ -56,7 +56,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_CONTROL};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DispatchMessageW, DestroyMenu, GetMessageW, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
+    DispatchMessageW, DestroyMenu, GetMessageW, GetClientRect, GetCursorPos, GetWindowLongPtrW, GetWindowRect,
     GetClassNameW, KillTimer, LoadCursorW, SendMessageW, PostMessageW, RegisterClassExW,
     SetForegroundWindow,
     SetTimer, SetWindowDisplayAffinity, SetWindowsHookExW, SetWindowLongPtrW, SetWindowPos,
@@ -1626,14 +1626,34 @@ impl App {
     /// 让温度计垂直居中对齐按钮行。宿主是桌面/任务栏（过滤类名）或拿不到按钮
     /// 边界时不动作。返回 true 表示已发起移动。
     unsafe fn sync_title_bar_height(&mut self) -> bool {
-        use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CAPTION_BUTTON_BOUNDS};
+        use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+        use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor};
         let mut r = RECT::default();
         if GetWindowRect(self.hwnd, &mut r).is_err() {
             return false;
         }
         let cx = (r.left + r.right) / 2;
         let cy = r.top + 12;
+        // WindowFromPoint 常返回内容子窗口（如 Edge 的
+        // Chrome_RenderWidgetHostHWND），取 GA_ROOT 得到真正的顶层窗口
         let host = WindowFromPoint(POINT { x: cx, y: cy });
+        let host = if host.is_invalid() {
+            host
+        } else {
+            GetAncestor(host, GA_ROOT)
+        };
+        let dump0 = std::env::var("TEMPMON_DODGE_DEBUG").is_ok();
+        if dump0 {
+            let mut c0 = [0u16; 64];
+            let n0 = if host.is_invalid() { 0 } else { GetClassNameW(host, &mut c0) };
+            eprintln!(
+                "[title-sync] entry cx={} cy={} host_invalid={} cls={}",
+                cx,
+                cy,
+                host.is_invalid(),
+                String::from_utf16_lossy(&c0[..n0 as usize])
+            );
+        }
         if host.is_invalid() || host == self.hwnd {
             return false;
         }
@@ -1646,24 +1666,25 @@ impl App {
         ) {
             return false; // 桌面/任务栏：保持当前位置
         }
-        let mut host_r = RECT::default();
-        if GetWindowRect(host, &mut host_r).is_err() {
-            return false;
-        }
-        let mut cbb = RECT::default();
-        if DwmGetWindowAttribute(
+        // 可见上缘（EXTENDED_FRAME_BOUNDS 去掉不可见边框）+ Win11 标题栏
+        // 按钮标准中心 24px。不用 DWMWA_CAPTION_BUTTON_BOUNDS：Edge/Chrome
+        // 等自绘标题栏窗口的该值覆盖整个标签条，明显偏离真实按钮位置
+        let mut efb = RECT::default();
+        let vis_top = if DwmGetWindowAttribute(
             host,
-            DWMWA_CAPTION_BUTTON_BOUNDS,
-            &mut cbb as *mut RECT as *mut core::ffi::c_void,
+            windows::Win32::Graphics::Dwm::DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut efb as *mut RECT as *mut core::ffi::c_void,
             std::mem::size_of::<RECT>() as u32,
         )
-        .is_err()
-            || cbb.bottom <= cbb.top
+        .is_ok()
+            && efb.bottom > efb.top
         {
+            efb.top
+        } else {
             return false;
-        }
+        };
         // 按钮行的屏幕绝对中心；温度计上下居中对齐
-        let btn_center = host_r.top + (cbb.top + cbb.bottom) / 2;
+        let btn_center = vis_top + 24;
         let h = r.bottom - r.top;
         let mut wa = RECT::default();
         let _ = SystemParametersInfoW(
@@ -1673,6 +1694,18 @@ impl App {
             windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
         );
         let ty = (btn_center - h / 2).max(wa.top);
+        let dump = std::env::var("TEMPMON_DODGE_DEBUG").is_ok();
+        if dump {
+            eprintln!(
+                "[title-sync] host={} vis_top={} h={} cur_y={} -> ty={} (d={})",
+                cls,
+                vis_top,
+                h,
+                r.top,
+                ty,
+                ty - r.top
+            );
+        }
         if (ty - r.top).abs() <= 3 {
             return false; // 已对齐（±3px 内不动）
         }
