@@ -323,6 +323,8 @@ struct App {
     cap: Option<CapReq>,
     dctx: Option<DodgeCtx>,
     fb_x: i32,
+    free_streak: u32,
+    ret_cooldown_until: Option<Instant>,
     fb_d: f32,
     fb_runs: u32,
 }
@@ -673,6 +675,8 @@ impl App {
         cap: None,
         dctx: None,
         fb_x: 0,
+        free_streak: 0,
+        ret_cooldown_until: None,
         fb_d: 0.0,
         fb_runs: 0,
             };
@@ -1669,10 +1673,18 @@ impl App {
             let has = has || cap_hit;
             if in_bounds && !has {
                 self.fb_runs = 0;
+                self.free_streak = self.free_streak.saturating_add(1);
                 // 未遮挡：若曾挪离右缘且右侧还有空间，转整行检查能否回归右缘。
-                // 只迁往完全空位，不会为靠边而压住内容
-                let want_right = self.pos.is_some() && ctx.left0 + ctx.max_w < ctx.wa.right;
+                // 双重阻尼防乒乓：①当前位连续 2 次检测都空闲（内容稳定）；
+                // ②距上次任何移动 ≥30s（刚避让完不立刻回弹）
+                let want_right = self.pos.is_some()
+                    && ctx.left0 + ctx.max_w < ctx.wa.right
+                    && self.free_streak >= 2
+                    && self
+                        .ret_cooldown_until
+                        .is_none_or(|t| t <= Instant::now());
                 if want_right {
+                    self.free_streak = 0;
                     self.dctx = Some(DodgeCtx { ret_right: true, ..ctx });
                     let strip_x = ctx.wa.left;
                     let strip_w = ctx.wa.right - ctx.wa.left;
@@ -1683,6 +1695,7 @@ impl App {
                 self.dctx = None;
                 return; // 常态：无遮挡
             }
+            self.free_streak = 0;
             // 确认遮挡（或超界）：固定当前位置（此后左缘锚定向右伸展），整行截取
             self.pos = Some(POINT { x: ctx.x0, y: ctx.y });
             let strip_x = ctx.wa.left;
@@ -1780,12 +1793,15 @@ impl App {
                 .map(|&(nx, _, _)| nx)
                 .max();
             if let Some(nx) = best {
-                if nx > ctx.left0 {
+                // 明显更靠右才动（≥100px），且移动后进入 30s 冷却——防乒乓
+                if nx > ctx.left0 + 100 {
                     self.fb_x = 0;
                     self.fade_x = nx;
                     self.fade_y = ctx.y;
                     self.dodging = true;
                     self.fade_phase = 1;
+                    self.ret_cooldown_until =
+                        Some(Instant::now() + std::time::Duration::from_secs(30));
                     let _ = SetTimer(Some(self.hwnd), DODGE_TIMER_ID, DODGE_TIMER_MS, None);
                 }
             }
@@ -1855,6 +1871,9 @@ impl App {
             self.fade_y = ctx.y;
             self.dodging = true;
             self.fade_phase = 1;
+            // 避让后 30s 内不做回归右缘检查——先稳定驻留，防乒乓
+            self.ret_cooldown_until =
+                Some(Instant::now() + std::time::Duration::from_secs(30));
             if fallback && self.fb_runs >= 3 {
                 self.last_dodge = Some(Instant::now() + std::time::Duration::from_secs(26));
             }
