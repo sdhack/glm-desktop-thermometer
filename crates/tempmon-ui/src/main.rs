@@ -263,6 +263,7 @@ struct Config {
     refresh_ms: u32,
     bg_mode: u8,
     dodge_secs: u32,
+    pinned: bool,
 }
 
 struct App {
@@ -319,6 +320,7 @@ struct App {
     last_checked_w: i32,
     rendered_once: bool,
     dodge_secs: u32,
+    user_pinned: bool,
     started_at: Instant,
     cap: Option<CapReq>,
     dctx: Option<DodgeCtx>,
@@ -346,6 +348,7 @@ fn load_config() -> Config {
         refresh_ms: 1000,
         bg_mode: 0,
         dodge_secs: 1,
+        pinned: false,
     };
     if let Some(p) = config_path() {
         if let Ok(text) = std::fs::read_to_string(p) {
@@ -366,6 +369,7 @@ fn load_config() -> Config {
                         // 事件驱动开关：任何非 0 值视为开启
                         cfg.dodge_secs = if v == 0 { 0 } else { 1 }
                     }
+                    ("pinned", Ok(b)) => cfg.pinned = b != 0,
                     ("x", Ok(x)) => {
                         cfg.pos = Some(POINT { x, y: cfg.pos.map(|q| q.y).unwrap_or(0) })
                     }
@@ -389,7 +393,7 @@ fn save_config(cfg: &Config) {
             None => String::new(),
         };
         let text = format!(
-            "collapsed={}\nalpha={}\ncapsule={}\nrow={}\nrotate={}\nrefresh={}\nbg={}\ndodge={}\n{}",
+            "collapsed={}\nalpha={}\ncapsule={}\nrow={}\nrotate={}\nrefresh={}\nbg={}\ndodge={}\npinned={}\n{}",
             cfg.collapsed as u8,
             cfg.alpha,
             cfg.capsule_items,
@@ -398,6 +402,7 @@ fn save_config(cfg: &Config) {
             cfg.refresh_ms,
             cfg.bg_mode,
             cfg.dodge_secs,
+            cfg.pinned as u8,
             pos_line,
         );
         let _ = std::fs::write(p, text);
@@ -671,6 +676,7 @@ impl App {
         last_checked_w: 0,
         rendered_once: false,
         dodge_secs: cfg.dodge_secs,
+        user_pinned: cfg.pinned,
         started_at: Instant::now(),
         cap: None,
         dctx: None,
@@ -1552,6 +1558,12 @@ impl App {
                     return;
                 }
             }
+            // 标题栏垂直同步：非手动钉住时，让温度计与宿主窗口的标题栏按钮行
+            // 保持同一高度（不同软件的标题栏高度不同，用 DWM 按钮边界自适应）。
+            // 挪动后直接返回，下一轮再做遮挡检测
+            if !self.user_pinned && self.sync_title_bar_height() {
+                return;
+            }
         }
         if self.cap.is_some() {
             return; // 上一次截取尚未完成
@@ -1607,6 +1619,71 @@ impl App {
 
     fn debug_on(&self) -> bool {
         std::env::var("TEMPMON_DODGE_DEBUG").is_ok()
+    }
+
+    /// 标题栏垂直同步：取温度计中点下方的宿主窗口（自身穿透，WindowFromPoint
+    /// 会跳过自己），用 DWMWA_CAPTION_BUTTON_BOUNDS 拿到标题栏按钮的真实位置，
+    /// 让温度计垂直居中对齐按钮行。宿主是桌面/任务栏（过滤类名）或拿不到按钮
+    /// 边界时不动作。返回 true 表示已发起移动。
+    unsafe fn sync_title_bar_height(&mut self) -> bool {
+        use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CAPTION_BUTTON_BOUNDS};
+        let mut r = RECT::default();
+        if GetWindowRect(self.hwnd, &mut r).is_err() {
+            return false;
+        }
+        let cx = (r.left + r.right) / 2;
+        let cy = r.top + 12;
+        let host = WindowFromPoint(POINT { x: cx, y: cy });
+        if host.is_invalid() || host == self.hwnd {
+            return false;
+        }
+        let mut cls = [0u16; 64];
+        let n = GetClassNameW(host, &mut cls);
+        let cls = String::from_utf16_lossy(&cls[..n as usize]);
+        if matches!(
+            cls.as_str(),
+            "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd"
+        ) {
+            return false; // 桌面/任务栏：保持当前位置
+        }
+        let mut host_r = RECT::default();
+        if GetWindowRect(host, &mut host_r).is_err() {
+            return false;
+        }
+        let mut cbb = RECT::default();
+        if DwmGetWindowAttribute(
+            host,
+            DWMWA_CAPTION_BUTTON_BOUNDS,
+            &mut cbb as *mut RECT as *mut core::ffi::c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .is_err()
+            || cbb.bottom <= cbb.top
+        {
+            return false;
+        }
+        // 按钮行的屏幕绝对中心；温度计上下居中对齐
+        let btn_center = host_r.top + (cbb.top + cbb.bottom) / 2;
+        let h = r.bottom - r.top;
+        let mut wa = RECT::default();
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut wa as *mut RECT as _),
+            windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        let ty = (btn_center - h / 2).max(wa.top);
+        if (ty - r.top).abs() <= 3 {
+            return false; // 已对齐（±3px 内不动）
+        }
+        self.pos = Some(POINT { x: r.left, y: ty });
+        self.fade_x = r.left;
+        self.fade_y = ty;
+        self.dodging = true;
+        self.fade_phase = 1;
+        self.ret_cooldown_until = Some(Instant::now() + std::time::Duration::from_secs(10));
+        let _ = SetTimer(Some(self.hwnd), DODGE_TIMER_ID, DODGE_TIMER_MS, None);
+        true
     }
 
     /// 截屏定时器回调：执行截屏（毫秒级）并根据阶段继续流程
@@ -1678,6 +1755,7 @@ impl App {
                 // 双重阻尼防乒乓：①当前位连续 2 次检测都空闲（内容稳定）；
                 // ②距上次任何移动 ≥30s（刚避让完不立刻回弹）
                 let want_right = self.pos.is_some()
+                    && !self.user_pinned
                     && ctx.left0 + ctx.max_w < ctx.wa.right
                     && self.free_streak >= 2
                     && self
@@ -1975,6 +2053,7 @@ impl App {
             refresh_ms: self.refresh_ms,
             bg_mode: self.bg_mode,
             dodge_secs: self.dodge_secs,
+            pinned: self.user_pinned,
         }
     }
 
@@ -1983,6 +2062,7 @@ impl App {
             let mut r = RECT::default();
             if GetWindowRect(self.hwnd, &mut r).is_ok() {
                 self.pos = Some(POINT { x: r.left, y: r.top });
+                self.user_pinned = true;
                 save_config(&self.as_config());
             }
         }
@@ -2470,6 +2550,7 @@ unsafe extern "system" fn wndproc(
                     }
                     MENU_RESET_POS => {
                         (*ptr).pos = None;
+                        (*ptr).user_pinned = false;
                         save_config(&(*ptr).as_config());
                     }
                     id if (MENU_CAPSULE_BASE..MENU_CAPSULE_BASE + 9).contains(&id) => {
