@@ -1517,14 +1517,30 @@ impl App {
         }
     }
 
-    fn apply_bg_effect(&self) {
+    fn apply_bg_effect(&mut self) {
         unsafe {
             let acrylic = self.bg_mode >= 2;
             apply_acrylic(self.hwnd, acrylic, self.bg_mode == 3);
-            if acrylic && self.dwm_round_ok {
-                let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(self.hwnd, None, true);
-                set_no_shadow(self.hwnd);
-            } else if !acrylic {
+            if acrylic {
+                // DWM 圆角只在启动时背景为毛玻璃的分支里尝试过——从普通模式
+                // 切到毛玻璃会永远拿不到圆角。切换时当场尝试，失败再退区域裁剪
+                let pref = windows::Win32::Graphics::Dwm::DWMWCP_ROUND;
+                let hr = windows::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                    self.hwnd,
+                    windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(33),
+                    &pref as *const _ as *const core::ffi::c_void,
+                    4,
+                );
+                self.dwm_round_ok = hr.is_ok();
+                if self.dwm_round_ok {
+                    let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(self.hwnd, None, true);
+                    set_no_shadow(self.hwnd);
+                } else {
+                    let rgn = CreateRoundRectRgn(0, 0, 421, 41, 16, 16);
+                    let _ =
+                        windows::Win32::Graphics::Gdi::SetWindowRgn(self.hwnd, Some(rgn), true);
+                }
+            } else {
                 let rgn = CreateRoundRectRgn(0, 0, 421, 41, 16, 16);
                 let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(self.hwnd, Some(rgn), true);
             }
