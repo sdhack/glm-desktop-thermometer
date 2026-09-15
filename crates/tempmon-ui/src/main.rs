@@ -82,7 +82,7 @@ const DODGE_RETRY_TIMER_ID: usize = 4;
 // 事件节流窗口：窗口动画期间的事件风暴合并为一次检测
 const DODGE_THROTTLE_MS: usize = 300;
 // 兜底轮询周期：即使没有任何窗口事件也定期查一次（后台窗口内容变化等场景）
-const DODGE_SWEEP_MS: usize = 2500;
+const DODGE_SWEEP_MS: usize = 1500;
 // 排除标志生效到截屏之间的等待（定时器，不阻塞 UI 线程）
 const CAP_CAPTURE_DELAY_MS: u32 = 45;
 // 检测上下文：请求阶段计算一次，截屏回调中复用
@@ -1562,27 +1562,6 @@ impl App {
                     return;
                 }
             }
-            // 标题栏高度同步（截图判定）：每 ≥10s 截一次右上角 200×48 条带，
-            // 分析按钮/图标边缘行的垂直中心，把温度计对齐过去。手动拖拽
-            // 钉住的位置不参与
-            if !self.user_pinned
-                && self
-                    .last_sync_check
-                    .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10))
-                && !self.cap.is_some()
-            {
-                self.last_sync_check = Some(Instant::now());
-                let mut wa0 = RECT::default();
-                let _ = SystemParametersInfoW(
-                    SPI_GETWORKAREA,
-                    0,
-                    Some(&mut wa0 as *mut RECT as _),
-                    windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-                );
-                if self.begin_capture(wa0.left, wa0.top, wa0.right - wa0.left, 48, false, true) {
-                    return;
-                }
-            }
         }
         if self.cap.is_some() {
             return; // 上一次截取尚未完成
@@ -1709,19 +1688,20 @@ impl App {
             let has = has || cap_hit;
             if in_bounds && !has {
                 self.fb_runs = 0;
-                self.free_streak = self.free_streak.saturating_add(1);
-                // 未遮挡：若曾挪离右缘且右侧还有空间，转整行检查能否回归右缘。
-                // 双重阻尼防乒乓：①当前位连续 2 次检测都空闲（内容稳定）；
-                // ②距上次任何移动 ≥30s（刚避让完不立刻回弹）
+                // 未遮挡：顺路做标题栏同步 / 回归右缘的整行截取
+                // （绝不在此前的遮挡检测前抢占轮次，窗口切换永远即时响应）
+                let sync_due = self
+                    .last_sync_check
+                    .is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(10));
+                if sync_due {
+                    self.last_sync_check = Some(Instant::now());
+                }
+                let cd_ok = self.ret_cooldown_until.is_none_or(|t| t <= Instant::now());
                 let want_right = self.pos.is_some()
                     && !self.user_pinned
                     && ctx.left0 + ctx.max_w < ctx.wa.right
-                    && self.free_streak >= 2
-                    && self
-                        .ret_cooldown_until
-                        .is_none_or(|t| t <= Instant::now());
-                if want_right {
-                    self.free_streak = 0;
+                    && cd_ok;
+                if !self.user_pinned && (want_right || sync_due) {
                     self.dctx = Some(DodgeCtx { ret_right: true, ..ctx });
                     let strip_x = ctx.wa.left;
                     let strip_w = ctx.wa.right - ctx.wa.left;
@@ -1732,7 +1712,6 @@ impl App {
                 self.dctx = None;
                 return; // 常态：无遮挡
             }
-            self.free_streak = 0;
             // 确认遮挡（或超界）：固定当前位置（此后左缘锚定向右伸展），整行截取
             self.pos = Some(POINT { x: ctx.x0, y: ctx.y });
             let strip_x = ctx.wa.left;
@@ -1832,14 +1811,15 @@ impl App {
                 .map(|c| ctx.wa.top + c - ctx.h / 2)
                 .map(|y| y.max(ctx.wa.top));
             let mut dest: Option<POINT> = None;
+            let cd_ok = self.ret_cooldown_until.is_none_or(|t| t <= Instant::now());
             let best = evaluated
                 .iter()
                 .filter(|(_, occupied, _)| !occupied)
                 .map(|&(nx, _, _)| nx)
                 .max();
             if let Some(nx) = best {
-                // 明显更靠右才动（≥100px），移动后进入 30s 冷却——防乒乓
-                if nx > ctx.left0 + 100 {
+                // 明显更靠右才动（≥100px），且冷却期外；y 对齐不受冷却限制
+                if nx > ctx.left0 + 100 && cd_ok {
                     dest = Some(POINT { x: nx, y: ty.unwrap_or(ctx.y) });
                 }
             }
