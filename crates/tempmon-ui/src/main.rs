@@ -1579,7 +1579,7 @@ impl App {
                     Some(&mut wa0 as *mut RECT as _),
                     windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
                 );
-                if self.begin_capture(wa0.right - 200, wa0.top, 200, 48, false, true) {
+                if self.begin_capture(wa0.left, wa0.top, wa0.right - wa0.left, 48, false, true) {
                     return;
                 }
             }
@@ -1678,7 +1678,8 @@ impl App {
             // 第一阶段：当前占位是否压住内容；边界超界也进入重选流程
             let Some(ctx) = self.dctx else { return };
             let in_bounds = ctx.left0 >= ctx.wa.left && ctx.left0 + ctx.cur_w <= ctx.wa.right;
-            let stats = edge_region_stats(&edge, req.w as usize, req.h as usize, 0, req.w as usize);
+            let stats =
+                edge_region_stats(&edge, req.w as usize, req.h as usize, 0, req.w as usize, 0, req.h as usize);
             if dump {
                 eprintln!("[dodge] phase1 w={} stats={:?}", req.w, stats);
             }
@@ -1724,7 +1725,7 @@ impl App {
                     self.dctx = Some(DodgeCtx { ret_right: true, ..ctx });
                     let strip_x = ctx.wa.left;
                     let strip_w = ctx.wa.right - ctx.wa.left;
-                    if self.begin_capture(strip_x, ctx.y, strip_w, ctx.h, true, false) {
+                    if self.begin_capture(strip_x, ctx.wa.top, strip_w, 48, true, false) {
                         return;
                     }
                 }
@@ -1736,7 +1737,7 @@ impl App {
             self.pos = Some(POINT { x: ctx.x0, y: ctx.y });
             let strip_x = ctx.wa.left;
             let strip_w = ctx.wa.right - ctx.wa.left;
-            if !self.begin_capture(strip_x, ctx.y, strip_w, ctx.h, true, false) {
+            if !self.begin_capture(strip_x, ctx.wa.top, strip_w, 48, true, false) {
                 self.dctx = None;
             }
             return;
@@ -1744,14 +1745,17 @@ impl App {
 
         // 第二阶段：整行边缘图上选新位置
         let Some(ctx) = self.dctx else { return };
-        let (strip_w, h, max_w) = (req.w as usize, req.h as usize, ctx.max_w);
+        // 整条截取自工作区顶部（48px 高），温度计自身占据其中 wy0..wy0+rh 的行带
+        let (strip_w, strip_h, max_w) = (req.w as usize, req.h as usize, ctx.max_w);
+        let wy0 = (ctx.y - ctx.wa.top).max(0) as usize;
+        let rh = ctx.h as usize;
         // 内容遮挡 + 标题栏按钮区（避免挪到的新位置又压住按钮）
         let occ = |x: i32| -> bool {
             let ox = (x - ctx.wa.left) as usize;
             if ox + max_w as usize > strip_w {
                 return true; // 越界视为有遮挡
             }
-            if edge_region_has_content(&edge, strip_w, h, ox, max_w as usize) {
+            if edge_region_has_content(&edge, strip_w, strip_h, ox, max_w as usize, wy0, rh) {
                 return true;
             }
             let mut sx = x + max_w - 8;
@@ -1811,7 +1815,7 @@ impl App {
                 if ox + max_w as usize > strip_w {
                     return None;
                 }
-                let all = edge_region_stats(&edge, strip_w, h, ox, max_w as usize)?;
+                let all = edge_region_stats(&edge, strip_w, strip_h, ox, max_w as usize, wy0, rh)?;
                 let occupied = occ(nx);
                 if dump {
                     eprintln!("[dodge] cand x={} stats={:?}", nx, all);
@@ -1823,23 +1827,39 @@ impl App {
         // 回归右缘模式：当前未遮挡，只在完全空位中挑最靠右的（x 最大）；
         // 已在最右（无更靠右空位）则原地不动
         if ctx.ret_right {
+            // 目标 y：条带内容带中心（左右内容都参与定位），与 x 一步到位
+            let ty = strip_content_center_y(&edge, strip_w, strip_h)
+                .map(|c| ctx.wa.top + c - ctx.h / 2)
+                .map(|y| y.max(ctx.wa.top));
+            let mut dest: Option<POINT> = None;
             let best = evaluated
                 .iter()
                 .filter(|(_, occupied, _)| !occupied)
                 .map(|&(nx, _, _)| nx)
                 .max();
             if let Some(nx) = best {
-                // 明显更靠右才动（≥100px），且移动后进入 30s 冷却——防乒乓
+                // 明显更靠右才动（≥100px），移动后进入 30s 冷却——防乒乓
                 if nx > ctx.left0 + 100 {
-                    self.fb_x = 0;
-                    self.fade_x = nx;
-                    self.fade_y = ctx.y;
-                    self.dodging = true;
-                    self.fade_phase = 1;
-                    self.ret_cooldown_until =
-                        Some(Instant::now() + std::time::Duration::from_secs(30));
-                    let _ = SetTimer(Some(self.hwnd), DODGE_TIMER_ID, DODGE_TIMER_MS, None);
+                    dest = Some(POINT { x: nx, y: ty.unwrap_or(ctx.y) });
                 }
+            }
+            if dest.is_none() {
+                // x 已在最右：只修 y 偏差
+                if let Some(y) = ty {
+                    if (y - ctx.y).abs() > 3 {
+                        dest = Some(POINT { x: ctx.left0, y });
+                    }
+                }
+            }
+            if let Some(d) = dest {
+                self.fb_x = 0;
+                self.fade_x = d.x;
+                self.fade_y = d.y;
+                self.dodging = true;
+                self.fade_phase = 1;
+                self.ret_cooldown_until =
+                    Some(Instant::now() + std::time::Duration::from_secs(30));
+                let _ = SetTimer(Some(self.hwnd), DODGE_TIMER_ID, DODGE_TIMER_MS, None);
             }
             return;
         }
@@ -1864,9 +1884,11 @@ impl App {
             let cur_d = edge_region_stats(
                 &edge,
                 strip_w,
-                h,
+                strip_h,
                 (ctx.left0 - ctx.wa.left) as usize,
                 max_w as usize,
+                wy0,
+                rh,
             )
             .map(|s| s.0)
             .unwrap_or(1.0);
@@ -1904,7 +1926,11 @@ impl App {
             let fallback = evaluated.iter().all(|(_, o, _)| *o);
             self.fb_runs = if fallback { self.fb_runs + 1 } else { 0 };
             self.fade_x = nx;
-            self.fade_y = ctx.y;
+            // 一步到位：x 与标题栏对齐 y 同时移动，不再分两段
+            self.fade_y = strip_content_center_y(&edge, strip_w, strip_h)
+                .map(|c| ctx.wa.top + c - ctx.h / 2)
+                .map(|y| y.max(ctx.wa.top))
+                .unwrap_or(ctx.y);
             self.dodging = true;
             self.fade_phase = 1;
             // 避让后 30s 内不做回归右缘检查——先稳定驻留，防乒乓
@@ -1923,45 +1949,13 @@ impl App {
     fn title_sync_from_strip(&mut self, edge: &[u8], req: &CapReq) {
         let w = req.w as usize;
         let h = req.h as usize;
-        if w < 16 || h < 16 {
-            return;
-        }
-        let mut row_density = vec![0f32; h];
-        for y in 1..h - 1 {
-            let mut c = 0u32;
-            for x in 1..w - 1 {
-                c += edge[y * w + x] as u32;
-            }
-            row_density[y] = c as f32 / (w - 2) as f32;
-        }
-        // 按钮带：从第一处密度 >0.05 的行起，容忍 ≤4 行稀疏，延伸到带尾
-        let mut start = None;
-        for y in 0..h {
-            if row_density[y] > 0.05 {
-                start = Some(y);
-                break;
-            }
-        }
-        let Some(s0) = start else {
+        let Some(cy) = strip_content_center_y(edge, w, h) else {
             if self.debug_on() {
                 eprintln!("[title-sync] strip has no content rows");
             }
             return;
         };
-        let mut end = s0;
-        let mut gap = 0usize;
-        for y in s0..h {
-            if row_density[y] > 0.04 {
-                end = y;
-                gap = 0;
-            } else {
-                gap += 1;
-                if gap > 4 {
-                    break;
-                }
-            }
-        }
-        let center = req.y + ((s0 + end) / 2) as i32;
+        let center = req.y + cy;
         unsafe {
             let mut r = RECT::default();
             if GetWindowRect(self.hwnd, &mut r).is_err() {
@@ -1979,11 +1973,11 @@ impl App {
             let d = ty - r.top;
             if self.debug_on() {
                 eprintln!(
-                    "[title-sync] band=({s0},{end}) center={center} h={h_w} cur_y={} ty={ty} d={d}",
+                    "[title-sync] center_row={center} h={h_w} cur_y={} ty={ty} d={d}",
                     r.top
                 );
             }
-            if d.abs() <= 3 {
+            if d.abs() <= 4 {
                 return;
             }
             self.pos = Some(POINT { x: r.left, y: ty });
@@ -2183,23 +2177,47 @@ fn compute_edge_map(px: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
 }
 
 /// 在边缘图上统计子区域：整体密度、命中的 8px 条带数/总数、是否含紧凑图标块
+/// 条带内容的加权垂直中心（按每行边缘像素数加权）：
+/// 连续平滑无带边界跳变；只统计上部 44 行（再往下是页面内容）
+fn strip_content_center_y(edge: &[u8], w: usize, h: usize) -> Option<i32> {
+    if w < 16 || h < 8 {
+        return None;
+    }
+    let rows = h.min(44);
+    let mut sum = 0f64;
+    let mut cnt = 0u64;
+    for y in 1..rows - 1 {
+        let mut c = 0u32;
+        for x in 1..w - 1 {
+            c += edge[y * w + x] as u32;
+        }
+        if c > 0 {
+            sum += c as f64 * y as f64;
+            cnt += c as u64;
+        }
+    }
+    (cnt > 0).then_some((sum / cnt as f64) as i32)
+}
+
 fn edge_region_stats(
     edge: &[u8],
     w: usize,
     h: usize,
     ox: usize,
     rw: usize,
+    oy: usize,
+    rh: usize,
 ) -> Option<(f32, usize, usize, bool)> {
-    if rw < 8 || h < 8 || ox + rw > w {
+    if rw < 8 || rh < 8 || ox + rw > w || oy + rh > h {
         return None;
     }
     let mut total = 0u32;
-    for yy in 1..h - 1 {
+    for yy in oy + 1..oy + rh - 1 {
         for xx in ox + 1..ox + rw - 1 {
             total += edge[yy * w + xx] as u32;
         }
     }
-    let area = ((rw - 2) * (h - 2)) as f32;
+    let area = ((rw - 2) * (rh - 2)) as f32;
     if area <= 0.0 {
         return None;
     }
@@ -2208,9 +2226,9 @@ fn edge_region_stats(
     // 文字：固定 8px 条带覆盖全部行高（含末尾不足 8px 的部分）
     let band = 8usize;
     let (mut bands_hit, mut bands_total) = (0usize, 0usize);
-    let mut y0 = 1;
-    while y0 < h - 1 {
-        let ye = (y0 + band).min(h - 1);
+    let mut y0 = oy + 1;
+    while y0 < oy + rh - 1 {
+        let ye = (y0 + band).min(oy + rh - 1);
         let mut c = 0u32;
         for yy in y0..ye {
             for xx in ox + 1..ox + rw - 1 {
@@ -2228,7 +2246,7 @@ fn edge_region_stats(
     // 图标/标识等紧凑高对比内容：任一 24×24 块（步进 12 重叠扫描）密度 ≥0.08
     let bs = 24usize;
     let mut has_icon_block = false;
-    if rw >= bs && h >= bs {
+    if rw >= bs && rh >= bs {
         // 步进 12 扫描；末尾补一个对齐区域右/下缘的块，避免边缘处的图标漏检
         let xs: Vec<usize> = {
             let mut v: Vec<usize> = (0..=rw - bs).step_by(12).collect();
@@ -2239,8 +2257,8 @@ fn edge_region_stats(
             v
         };
         let ys: Vec<usize> = {
-            let mut v: Vec<usize> = (0..=h - bs).step_by(12).collect();
-            let last = h - bs;
+            let mut v: Vec<usize> = (oy..=oy + rh - bs).step_by(12).collect();
+            let last = oy + rh - bs;
             if *v.last().unwrap() != last {
                 v.push(last);
             }
@@ -2265,9 +2283,17 @@ fn edge_region_stats(
 }
 
 /// 子区域是否含有文字/图标等内容
-fn edge_region_has_content(edge: &[u8], w: usize, h: usize, ox: usize, rw: usize) -> bool {
+fn edge_region_has_content(
+    edge: &[u8],
+    w: usize,
+    h: usize,
+    ox: usize,
+    rw: usize,
+    oy: usize,
+    rh: usize,
+) -> bool {
     let Some((density, bands_hit, bands_total, has_icon_block)) =
-        edge_region_stats(edge, w, h, ox, rw)
+        edge_region_stats(edge, w, h, ox, rw, oy, rh)
     else {
         return false;
     };
@@ -2280,7 +2306,7 @@ fn edge_region_has_content(edge: &[u8], w: usize, h: usize, ox: usize, rw: usize
     }
     // 行高较小（如 24px 的悬浮条）时文字可能只落入一两条带，只要求 1 条命中；
     // 行高较大时要求至少 2 条且命中过半，以排除照片类内容
-    if h < 24 {
+    if rh < 24 {
         bands_hit >= 1
     } else {
         bands_hit >= 2 && bands_hit * 2 > bands_total
