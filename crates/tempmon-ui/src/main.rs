@@ -79,6 +79,11 @@ const TIMER_ID: usize = 1;
 const DODGE_TIMER_ID: usize = 2;
 const CAP_TIMER_ID: usize = 3;
 const DODGE_RETRY_TIMER_ID: usize = 4;
+// 前台切换后的补查定时器（0.3/0.8/1.6s）：切换后软件可能延迟绘制标题栏，
+// 截图判定只能等真实像素出现——连发补查把响应压到 2s 内
+const DODGE_BURST_TIMER_ID: usize = 5;
+const DODGE_BURST_COUNT: usize = 5;
+const DODGE_BURST_MS: [u32; DODGE_BURST_COUNT] = [300, 800, 1600, 2600, 4000];
 // 事件节流窗口：窗口动画期间的事件风暴合并为一次检测
 const DODGE_THROTTLE_MS: usize = 300;
 // 兜底轮询周期：即使没有任何窗口事件也定期查一次（后台窗口内容变化等场景）
@@ -1568,7 +1573,7 @@ impl App {
         }
         let debug = std::env::var("TEMPMON_DODGE_DEBUG").is_ok();
         if debug {
-            eprintln!("[dodge] check at +{:.1}s", (Instant::now() - self.started_at).as_secs_f32());
+            eprintln!("[{}] [dodge] check at +{:.1}s", wallclock(), (Instant::now() - self.started_at).as_secs_f32());
         }
         // 节流：两次实际检测至少间隔 700ms（事件风暴/多来源触发时合并）
         let now_ms = START_MS
@@ -1666,7 +1671,7 @@ impl App {
                 if ic {
                     return true;
                 }
-                if !(0.015..0.5).contains(&d) {
+                if !(0.012..0.5).contains(&d) {
                     return false;
                 }
                 if req.h < 24 { bh >= 1 } else { bh >= 2 && bh * 2 > bt }
@@ -1893,7 +1898,8 @@ impl App {
 
         if dump {
             eprintln!(
-                "[dodge] phase2 done: candidates={} free={} target={:?}",
+                "[{}] [dodge] phase2 done: candidates={} free={} target={:?}",
+                wallclock(),
                 evaluated.len(),
                 evaluated.iter().filter(|(_, o, _)| !o).count(),
                 target,
@@ -1953,7 +1959,8 @@ impl App {
             let d = ty - r.top;
             if self.debug_on() {
                 eprintln!(
-                    "[title-sync] center_row={center} h={h_w} cur_y={} ty={ty} d={d}",
+                    "[{}] [title-sync] center_row={center} h={h_w} cur_y={} ty={ty} d={d}",
+                    wallclock(),
                     r.top
                 );
             }
@@ -2159,6 +2166,13 @@ fn compute_edge_map(px: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
 /// 在边缘图上统计子区域：整体密度、命中的 8px 条带数/总数、是否含紧凑图标块
 /// 条带内容的加权垂直中心（按每行边缘像素数加权）：
 /// 连续平滑无带边界跳变；只统计上部 44 行（再往下是页面内容）
+fn wallclock() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let sec = d.as_secs() % 86400;
+    format!("{:02}:{:02}:{:02}.{:03}", sec / 3600 + 8, (sec % 3600) / 60, sec % 60, d.subsec_millis())
+}
+
 fn strip_content_center_y(edge: &[u8], w: usize, h: usize) -> Option<i32> {
     if w < 16 || h < 8 {
         return None;
@@ -2425,6 +2439,18 @@ unsafe extern "system" fn dodge_event_hook(
         return;
     }
     DODGE_EVENT.store(true, std::sync::atomic::Ordering::Relaxed);
+    let hwnd = TOPMOST_HWND.load(std::sync::atomic::Ordering::Relaxed);
+    if hwnd == 0 {
+        return;
+    }
+    let hwnd = HWND(hwnd as _);
+    // 前台切换：安排 0.3/0.8/1.6s 三次补查（覆盖软件延迟绘制标题栏）
+    if _event == EVENT_SYSTEM_FOREGROUND {
+        for (i, &ms) in DODGE_BURST_MS.iter().enumerate() {
+            let _ = SetTimer(Some(hwnd), DODGE_BURST_TIMER_ID + i, ms, None);
+        }
+        return;
+    }
     // 节流 DODGE_THROTTLE_MS（读上次检测时刻，不写入——由 dodge_if_occluding 统一记账）
     let now = START_MS
         .get_or_init(std::time::Instant::now)
@@ -2693,6 +2719,14 @@ unsafe extern "system" fn wndproc(
                 }
             } else if wparam.0 == DODGE_RETRY_TIMER_ID {
                 let _ = KillTimer(Some(hwnd), DODGE_RETRY_TIMER_ID);
+                let ptr = app_ptr(hwnd);
+                if !ptr.is_null() {
+                    (*ptr).dodge_if_occluding();
+                }
+            } else if (DODGE_BURST_TIMER_ID..DODGE_BURST_TIMER_ID + DODGE_BURST_COUNT)
+                .contains(&wparam.0)
+            {
+                let _ = KillTimer(Some(hwnd), wparam.0);
                 let ptr = app_ptr(hwnd);
                 if !ptr.is_null() {
                     (*ptr).dodge_if_occluding();
