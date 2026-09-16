@@ -304,7 +304,8 @@ struct App {
     h_disk: Hold,
     h_fans: Hold,
     capsule_page: u32,
-    page_ticks: u32,
+    // 上次胶囊翻页时刻：按真实时间翻页；避让动画的 16ms 手动 tick 不再加速轮换
+    last_page_rot: Option<Instant>,
     dragging: bool,
     d2d: ID2D1Factory,
     rt: ID2D1DCRenderTarget,
@@ -663,7 +664,7 @@ impl App {
                 h_disk: Hold::default(),
                 h_fans: Hold::default(),
                 capsule_page: 0,
-                page_ticks: 0,
+                last_page_rot: None,
                 dragging: false,
                 d2d,
                 rt,
@@ -781,13 +782,19 @@ impl App {
 
     fn tick(&mut self) -> windows::core::Result<()> {
         if self.dragging {
+            // 拖拽期间冻结翻页计时，松手后不会立刻跳页
+            self.last_page_rot = Some(Instant::now());
             return Ok(());
         }
-        if self.collapsed {
-            self.page_ticks += 1;
-            let stay = (self.rotate_ms / 1000).max(1) as u32;
-            if self.page_ticks >= stay {
-                self.page_ticks = 0;
+        if self.collapsed && self.fade_phase == 0 {
+            // 按真实时间翻页：避让淡入淡出期间（fade_phase!=0，16ms 一次手动
+            // tick）不再翻页——旧实现按 tick 计数，动画期间页面飞速轮换，
+            // 窗口宽度随 CPU/GPU 页反复伸缩
+            let due = self
+                .last_page_rot
+                .map_or(true, |t| t.elapsed().as_millis() as u32 >= self.rotate_ms);
+            if due {
+                self.last_page_rot = Some(Instant::now());
                 self.capsule_page = self.capsule_page.wrapping_add(1);
             }
         }
@@ -2727,7 +2734,7 @@ unsafe extern "system" fn wndproc(
                 } else {
                     (*ptr).capsule_page = (*ptr).capsule_page.wrapping_sub(1);
                 }
-                (*ptr).page_ticks = 0;
+                (*ptr).last_page_rot = Some(Instant::now());
                 let _ = (*ptr).tick();
             }
             LRESULT(0)
