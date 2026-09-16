@@ -1765,7 +1765,8 @@ impl App {
                     self.dctx = Some(DodgeCtx { ret_right: true, ..ctx });
                     let strip_x = ctx.wa.left;
                     let strip_w = ctx.wa.right - ctx.wa.left;
-                    if self.begin_capture(strip_x, ctx.wa.top, strip_w, 48, true, false) {
+                    // 沿温度计当前行截取（手动拖动后不再钉在顶部 48px 条带）
+                    if self.begin_capture(strip_x, ctx.y, strip_w, ctx.h, true, false) {
                         return;
                     }
                 }
@@ -1776,7 +1777,8 @@ impl App {
             self.pos = Some(POINT { x: ctx.x0, y: ctx.y });
             let strip_x = ctx.wa.left;
             let strip_w = ctx.wa.right - ctx.wa.left;
-            if !self.begin_capture(strip_x, ctx.wa.top, strip_w, 48, true, false) {
+            // 沿温度计当前行截取（手动拖动后不再钉在顶部 48px 条带）
+            if !self.begin_capture(strip_x, ctx.y, strip_w, ctx.h, true, false) {
                 self.dctx = None;
             }
             return;
@@ -1784,9 +1786,9 @@ impl App {
 
         // 第二阶段：整行边缘图上选新位置
         let Some(ctx) = self.dctx else { return };
-        // 整条截取自工作区顶部（48px 高），温度计自身占据其中 wy0..wy0+rh 的行带
+        // 整条截取自温度计当前行（y=ctx.y、高 ctx.h），候选评估的行带即整幅
         let (strip_w, strip_h, max_w) = (req.w as usize, req.h as usize, ctx.max_w);
-        let wy0 = (ctx.y - ctx.wa.top).max(0) as usize;
+        let wy0 = 0usize;
         let rh = ctx.h as usize;
         // 内容遮挡 + 标题栏按钮区（避免挪到的新位置又压住按钮）
         let occ = |x: i32| -> bool {
@@ -1866,9 +1868,9 @@ impl App {
         // 回归右缘模式：当前未遮挡，只在完全空位中挑最靠右的（x 最大）；
         // 已在最右（无更靠右空位）则原地不动
         if ctx.ret_right {
-            // 目标 y：标题栏按钮带中心（右缘 400px），与 x 一步到位
+            // 目标 y：条带内容带中心（条带原点=ctx.y），与 x 一步到位
             let ty = strip_button_band_center_y(&edge, strip_w, strip_h)
-                .map(|c| ctx.wa.top + c - ctx.h / 2)
+                .map(|c| ctx.y + c - ctx.h / 2)
                 .map(|y| y.max(ctx.wa.top));
             let mut dest: Option<POINT> = None;
             let cd_ok = self.ret_cooldown_until.is_none_or(|t| t <= Instant::now());
@@ -1973,7 +1975,7 @@ impl App {
             self.fade_x = nx;
             // 一步到位：x 与标题栏对齐 y 同时移动，不再分两段
             self.fade_y = strip_button_band_center_y(&edge, strip_w, strip_h)
-                .map(|c| ctx.wa.top + c - ctx.h / 2)
+                .map(|c| ctx.y + c - ctx.h / 2)
                 .map(|y| y.max(ctx.wa.top))
                 .unwrap_or(ctx.y);
             self.dodging = true;
