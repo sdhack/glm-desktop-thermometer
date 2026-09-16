@@ -136,7 +136,10 @@ impl SensorHub {
         // CPU 温度与风扇转速：进程内 WinRing0 直读（Intel MSR + Nuvoton SuperIO），
         // 不再有子进程桥；驱动装载失败时为 None/空，对应段位由 UI 隐藏
         let (cpu_temp, fans) = ring0::sample();
-        s.cpu_temp = cpu_temp;
+        // 显示平滑：P 核毫秒级瞬变会让瞬时读数瞬间冲到 TjMax 再迅速回落，
+        // 1s 采样把 200ms 尖峰放大成整秒的"100°"观感。EMA(α=0.4，时间常数
+        // ~2s) 压平尖峰，持续升温仍紧跟；None 直通（驱动不可用时隐藏段位）
+        s.cpu_temp = smooth_cpu(cpu_temp);
         s.fans = fans;
 
         // GPU 温度：NVML 优先，NVAPI 兜底（懒加载）
@@ -604,6 +607,35 @@ pub fn disk_temps() -> Vec<f32> {
 }
 
 static DISK_CACHE: std::sync::Mutex<Vec<f32>> = std::sync::Mutex::new(Vec::new());
+
+// ---------------------------------------------------------------------------
+// CPU 温度显示平滑：EMA 低通，压掉 P 核毫秒级瞬变造成的单样本尖峰
+// ---------------------------------------------------------------------------
+
+static CPU_TEMP_EMA: std::sync::Mutex<Option<f32>> = std::sync::Mutex::new(None);
+
+/// α=0.4：单样本尖峰（如 43→100）只显示到 ~66°，持续高载 3-4 个采样
+/// （3-4s）内即跟上真实温度。传感器断了（None）时清空状态，直通隐藏。
+fn smooth_cpu(raw: Option<f32>) -> Option<f32> {
+    let Ok(mut ema) = CPU_TEMP_EMA.lock() else {
+        return raw;
+    };
+    match (raw, *ema) {
+        (Some(v), Some(prev)) => {
+            let s = prev + (v - prev) * 0.4;
+            *ema = Some(s);
+            Some(s)
+        }
+        (Some(v), None) => {
+            *ema = Some(v);
+            Some(v)
+        }
+        (None, _) => {
+            *ema = None;
+            None
+        }
+    }
+}
 
 /// 启动盘温轮询线程：原生 IOCTL 直读（免子进程）
 pub fn spawn_disk_poller() {
