@@ -125,9 +125,11 @@ const FADE_IN_STEP: f32 = 0.08;
 const MENU_EXIT: usize = 100;
 const MENU_COLLAPSE: usize = 200;
 const MENU_ALPHA_25: usize = 205;
-const MENU_ALPHA_50: usize = 201;
+const MENU_ALPHA_40: usize = 206;
+const MENU_ALPHA_55: usize = 201;
 const MENU_ALPHA_70: usize = 202;
-const MENU_ALPHA_90: usize = 203;
+const MENU_ALPHA_85: usize = 203;
+const MENU_ALPHA_100: usize = 204;
 const MENU_AUTOSTART: usize = 210;
 const MENU_RESET_POS: usize = 220;
 const MENU_CAPSULE_BASE: usize = 230;
@@ -1379,9 +1381,11 @@ impl App {
             if let Ok(sub) = CreatePopupMenu() {
                 for (id, label, v) in [
                     (MENU_ALPHA_25, w!("25%"), 64u8),
-                    (MENU_ALPHA_50, w!("50%"), 128u8),
+                    (MENU_ALPHA_40, w!("40%"), 102u8),
+                    (MENU_ALPHA_55, w!("55%"), 140u8),
                     (MENU_ALPHA_70, w!("70%"), 179u8),
-                    (MENU_ALPHA_90, w!("90%"), 230u8),
+                    (MENU_ALPHA_85, w!("85%"), 217u8),
+                    (MENU_ALPHA_100, w!("100%"), 255u8),
                 ] {
                     let _ = AppendMenuW(
                         sub,
@@ -2649,9 +2653,11 @@ unsafe extern "system" fn wndproc(
                     MENU_EXIT => PostQuitMessage(0),
                     MENU_COLLAPSE => (*ptr).toggle_collapse(),
                     MENU_ALPHA_25 => (*ptr).set_alpha(64),
-                    MENU_ALPHA_50 => (*ptr).set_alpha(128),
+                    MENU_ALPHA_40 => (*ptr).set_alpha(102),
+                    MENU_ALPHA_55 => (*ptr).set_alpha(140),
                     MENU_ALPHA_70 => (*ptr).set_alpha(179),
-                    MENU_ALPHA_90 => (*ptr).set_alpha(230),
+                    MENU_ALPHA_85 => (*ptr).set_alpha(217),
+                    MENU_ALPHA_100 => (*ptr).set_alpha(255),
                     MENU_AUTOSTART => {
                         let enable = !autostart_enabled();
                         set_autostart(enable);
