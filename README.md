@@ -11,7 +11,6 @@
 [![Release](https://img.shields.io/github/v/release/sdhack/glm-desktop-thermometer)](https://github.com/sdhack/glm-desktop-thermometer/releases/latest)
 [![Rust](https://img.shields.io/badge/Rust-1.77+-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?logo=windows11&logoColor=white)](https://www.microsoft.com/windows)
-[![.NET](https://img.shields.io/badge/.NET%208-仅桥接进程-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](#-license)
 
 </div>
@@ -33,7 +32,7 @@
 
 | | GLM 温度计 | RTSS | HWiNFO | 小 taskbar 工具 |
 |---|---|---|---|---|
-| 内存占用 | **~110MB 工作集（三进程实测：UI ~10MB + 采集 ~33MB + .NET 桥接 ~70MB，自动修剪）** | ~40MB | ~200MB | ~50MB |
+| 内存占用 | **~45MB 工作集（双进程实测：UI ~10MB + 采集 ~33MB，WinRing0 进程内直读，自动修剪）** | ~40MB | ~200MB | ~50MB |
 | 鼠标穿透 | ✅ 智能穿透 | ❌ | ❌ | 部分 |
 | 压住文字自动挪开 | ✅ 内容识别避让 | ❌ | ❌ | ❌ |
 | 全屏视频自动隐藏 | ✅ SMTC + 几何判定 | ❌ | ❌ | ❌ |
@@ -46,7 +45,7 @@
 
 | 段位 | 数据 | 数据源 |
 |---|---|---|
-| `CPU` | 占用率 + 温度 | PDH + LibreHardwareMonitor 桥接 |
+| `CPU` | 占用率 + 温度 | PDH + WinRing0 驱动进程内读 MSR |
 | `GPU` | 核心占用 + **温度** + 显存占用 | NVIDIA NVML / NVAPI / PDH / DXGI |
 | `MEM` | 内存占用率 | GlobalMemoryStatusEx |
 | `DISK` | NVMe / SATA 温度（最多 2 盘） | 存储 IOCTL 直读，失败回退 PowerShell |
@@ -136,7 +135,6 @@ git clone https://github.com/sdhack/glm-desktop-thermometer.git
 cd glm-desktop-thermometer
 
 cargo build --release                                    # 主程序
-cd lhm-bridge && dotnet publish -c Release               # CPU 温度/风扇桥接
 cp bin/Release/net8.0/win-x64/publish/* ../../target/release/
 ```
 
@@ -159,7 +157,7 @@ cp bin/Release/net8.0/win-x64/publish/* ../../target/release/
 └──────┬───────────────────────┬──────────────────────────────┘
        │ stdout                │ 存储栈 IOCTL（失败回退 PowerShell，60s）
 ┌──────▼──────────┐   ┌────────▼─────────┐
-│  lhm-bridge.exe │   │  硬盘温度          │
+│  WinRing0 直读  │   │  硬盘温度          │
 │  CPU 温度·风扇   │   └──────────────────┘
 │ (LibreHard…Lib) │
 └─────────────────┘
@@ -177,7 +175,7 @@ cp bin/Release/net8.0/win-x64/publish/* ../../target/release/
 - **单实例**：命名互斥体，双开自动退出——两个小部件打架、共享内存竞写？不存在
 - **点击 vs 拖拽判定**：记录按下坐标，位移 <6px 才算点击——拖完位置不会误触发展开
 - **防抖显示**：数据源短暂消失时沿用旧值 15 秒，段位不闪现闪没
-- **数据防冻结**：桥接缓存带 TTL，数据源 hang 死时隐藏温度段而不是显示旧值
+- **数据防冻结**：驱动读数带量程/有效位校验，异常时隐藏温度段而不是显示旧值
 - **系统级毛玻璃**：`SetWindowCompositionAttribute` 亚克力（未公开 API 动态解析，自动降级）
 - **零拷贝 IPC**：共享内存帧 + u32 位模式序号心跳（f32 槽位存不了大整数？位运算绕过），
   读侧序号前后比对丢弃撕裂帧，无序列化开销
@@ -191,7 +189,6 @@ cp bin/Release/net8.0/win-x64/publish/* ../../target/release/
 - **看门狗时间基 + 退避**：帧停滞按真实时间判定（8 秒），连续失败指数退避（最长 96 秒）——
   环境性故障不会引发进程重生风暴
 - **周期性工作集修剪**：三进程每 10 分钟 `SetProcessWorkingSetSize` 换出冷页，
-  桥接启动即修剪 + 工作站非并发 GC——常驻占用减半
 
 ## ⚙️ 全部可配置
 
@@ -270,14 +267,14 @@ cp bin/Release/net8.0/win-x64/publish/* ../../target/release/
 <summary><b>CPU 温度显示不了？</b></summary>
 
 CPU 温度来自 LibreHardwareMonitor 内核驱动，部分杀软（360 等）可能拦截。
-若温度段消失，检查 lhm-bridge 是否被拦截并添加信任。
+若温度段消失，检查 lhm-bridge.sys 是否被拦截并添加信任（CPU 温度/风扇需要管理员权限装载驱动）。
 </details>
 
 <details>
 <summary><b>进程内存怎么算？</b></summary>
 
-三进程工作集约 110MB：UI 界面 ~10MB、采集子进程 ~33MB、
-桥接进程 ~70MB（.NET 运行时 + LibreHardwareMonitorLib 是大头）。
+双进程工作集约 45MB：UI 界面 ~10MB、采集子进程 ~33MB（WinRing0 驱动进程内直读
+CPU 温度与风扇，无 .NET、无子进程桥）。
 主程序本体只有 200KB——大头都是生态库。所有进程挂 Job 对象管理，退出即全部回收，
 且每 10 分钟自动修剪工作集，占用常年保持低位；绝不会像某些工具一样在后台悄悄堆积。
 </details>
@@ -302,7 +299,7 @@ GPU 空闲时 Windows 会注销 PDH 计数器实例。已内置 15 秒防抖沿�
 ├─ crates/
 │  ├─ tempmon-ui/       # UI：窗口/渲染/策略/菜单/钩子/看门狗
 │  └─ tempmon-sensor/   # 采集：PDH/DXGI/NVML/共享内存协议
-├─ lhm-bridge/          # CPU 温度+风扇桥接（C# / LibreHardwareMonitorLib）
+├─ ring0.rs             # CPU 温度+风扇（WinRing0 驱动进程内直读，Intel MSR + NCT SuperIO）
 ├─ tools/               # 诊断脚本（避让检测 / 盘温验证）
 ├─ 方案.md              # 技术方案（架构/选型/风险/里程碑）
 └─ 开发记录.md          # 开发日志 + 踩坑记录

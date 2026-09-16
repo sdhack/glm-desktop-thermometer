@@ -17,6 +17,8 @@ use windows::Win32::System::Performance::{
 };
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
+mod ring0;
+
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Snapshot {
     pub cpu_usage: f32,
@@ -131,14 +133,11 @@ impl SensorHub {
         // 硬盘温度（NVMe/SMART，免驱动；读不到的盘自动隐藏）
         s.disk_temps = disk_temps();
 
-        // CPU 温度与风扇转速：来自 lhm-bridge 子进程的解析缓存（过期视为无效）
-        if let Ok(c) = LHM_CACHE.lock() {
-            let fresh = c.2.is_some_and(|t| t.elapsed() < LHM_TTL);
-            if fresh {
-                s.cpu_temp = c.0;
-                s.fans = c.1.clone();
-            }
-        }
+        // CPU 温度与风扇转速：进程内 WinRing0 直读（Intel MSR + Nuvoton SuperIO），
+        // 不再有子进程桥；驱动装载失败时为 None/空，对应段位由 UI 隐藏
+        let (cpu_temp, fans) = ring0::sample();
+        s.cpu_temp = cpu_temp;
+        s.fans = fans;
 
         // GPU 温度：NVML 优先，NVAPI 兜底（懒加载）
         if let Some(nv) = &mut self.nvml {
@@ -556,9 +555,8 @@ pub fn sensor_loop() {
             eprintln!("[sensor] hub ok");
         }
         spawn_disk_poller();
-        spawn_lhm_bridge();
         if debug {
-            eprintln!("[sensor] loop enter");
+            eprintln!("[sensor] hub ok");
         }
         let mut frame_no: u32 = 0;
         loop {
@@ -735,111 +733,6 @@ fn query_disk_temps_native() -> Option<Vec<f32>> {
     (!temps.is_empty()).then_some(temps)
 }
 
-// ---------------------------------------------------------------------------
-// lhm-bridge 桥接：CPU 温度 + 风扇转速（LibreHardwareMonitorLib，无窗子进程）
-// ---------------------------------------------------------------------------
-
-type LhmData = (Option<f32>, Vec<f32>, Option<std::time::Instant>);
-static LHM_CACHE: std::sync::Mutex<LhmData> = std::sync::Mutex::new((None, Vec::new(), None));
-
-/// 桥接数据的有效期：bridge 进程活着但卡住（不再输出）时，超时的旧值
-/// 视为无效，UI 隐藏而不是永久显示冻结的温度
-const LHM_TTL: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// 启动桥接读取线程；桥接进程退出（崩溃/被杀）后 5 秒自动重启。
-/// 桥接挂进本进程的 KILL_ON_JOB_CLOSE Job：本进程（sensor）被 UI 杀掉重启时，
-/// 孤儿桥接随之退出，不再堆积。
-pub fn spawn_lhm_bridge() {
-    std::thread::spawn(move || {
-        let job = create_bridge_job();
-        loop {
-            let _ = run_bridge_once(job);
-            std::thread::sleep(std::time::Duration::from_secs(5));
-        }
-    });
-}
-
-fn create_bridge_job() -> windows::Win32::Foundation::HANDLE {
-    use windows::Win32::System::JobObjects::{
-        CreateJobObjectW, SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JobObjectExtendedLimitInformation,
-    };
-    unsafe {
-        let job = CreateJobObjectW(None, PCWSTR::null()).expect("create bridge job");
-        let mut info = zeroed::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as _,
-            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        )
-        .expect("set bridge job limit");
-        job
-    }
-}
-
-fn bridge_exe_path() -> Option<std::path::PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    // 桥接与主程序同目录；开发期也可能在 lhm-bridge 发布目录
-    let cand = dir.join("lhm-bridge.exe");
-    if cand.exists() {
-        Some(cand)
-    } else {
-        None
-    }
-}
-
-fn run_bridge_once(job: windows::Win32::Foundation::HANDLE) -> Option<()> {
-    use std::io::BufRead;
-    use std::os::windows::process::CommandExt;
-    use windows::Win32::System::JobObjects::AssignProcessToJobObject;
-    use windows::Win32::Foundation::HANDLE;
-    let exe = bridge_exe_path()?;
-    let mut child = std::process::Command::new(exe)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .spawn()
-        .ok()?;
-    // 挂入 Job：本进程意外退出时桥接一并终止
-    unsafe {
-        use std::os::windows::io::AsRawHandle;
-        let _ = AssignProcessToJobObject(job, HANDLE(child.as_raw_handle() as _));
-    }
-    let stdout = match child.stdout.take() {
-        Some(s) => s,
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-    };
-    let reader = std::io::BufReader::new(stdout);
-    let mut cpu_temp = None;
-    let mut fans: Vec<f32> = Vec::new();
-    for line in reader.lines().map_while(Result::ok) {
-        if let Some(v) = line.strip_prefix("CPU_TEMP ") {
-            cpu_temp = v.trim().parse::<f32>().ok();
-        } else if let Some(rest) = line.strip_prefix("FAN ") {
-            if let Some(rpm) = rest.rsplit(' ').next().and_then(|x| x.parse::<f32>().ok()) {
-                if fans.len() < 3 {
-                    fans.push(rpm);
-                }
-            }
-        } else if line == "END" {
-            if let Ok(mut c) = LHM_CACHE.lock() {
-                *c = (cpu_temp, fans.clone(), Some(std::time::Instant::now()));
-            }
-            cpu_temp = None;
-            fans.clear();
-        }
-    }
-    // stdout 关闭 = 桥接退出；循环由外层负责重启
-    let _ = child.wait();
-    None
-}
 
 /// 配置文件路径（与 UI 侧 %APPDATA%	empmon.conf 一致）
 fn config_refresh_ms() -> std::path::PathBuf {
