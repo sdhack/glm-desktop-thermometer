@@ -136,6 +136,9 @@ const MENU_ALPHA_55: usize = 201;
 const MENU_ALPHA_70: usize = 202;
 const MENU_ALPHA_85: usize = 203;
 const MENU_ALPHA_100: usize = 204;
+/// 透明度菜单档位（与 MENU_ALPHA_* 一一对应）：加载配置时吸附到最近档，
+/// 保证右键菜单永远有当前值的勾选（旧版默认 230 不落在档位上 = 永远无勾）
+const ALPHA_CHOICES: [u8; 6] = [64, 102, 140, 179, 217, 255];
 const MENU_AUTOSTART: usize = 210;
 const MENU_RESET_POS: usize = 220;
 const MENU_PIN: usize = 225;
@@ -569,7 +572,7 @@ fn config_path() -> Option<PathBuf> {
 fn load_config() -> Config {
     let mut cfg = Config {
         collapsed: false,
-        alpha: 230,
+        alpha: 217,
         pos: None,
         capsule_items: CAPS_DEFAULT,
         row_items: ROW_DEFAULT,
@@ -612,6 +615,11 @@ fn load_config() -> Config {
             }
         }
     }
+    // 吸附到最近档位：历史配置里的任意值（如旧默认 230）在菜单中无勾可对
+    cfg.alpha = *ALPHA_CHOICES
+        .iter()
+        .min_by_key(|&&a| (a as i16 - cfg.alpha as i16).abs())
+        .unwrap_or(&217);
     cfg
 }
 
@@ -1606,14 +1614,17 @@ impl App {
                 let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("背景颜色"));
             }
             if let Ok(sub) = CreatePopupMenu() {
-                for (id, label, v) in [
-                    (MENU_ALPHA_25, w!("25%"), 64u8),
-                    (MENU_ALPHA_40, w!("40%"), 102u8),
-                    (MENU_ALPHA_55, w!("55%"), 140u8),
-                    (MENU_ALPHA_70, w!("70%"), 179u8),
-                    (MENU_ALPHA_85, w!("85%"), 217u8),
-                    (MENU_ALPHA_100, w!("100%"), 255u8),
-                ] {
+                for ((id, label), v) in [
+                    (MENU_ALPHA_25, w!("25%")),
+                    (MENU_ALPHA_40, w!("40%")),
+                    (MENU_ALPHA_55, w!("55%")),
+                    (MENU_ALPHA_70, w!("70%")),
+                    (MENU_ALPHA_85, w!("85%")),
+                    (MENU_ALPHA_100, w!("100%")),
+                ]
+                .into_iter()
+                .zip(ALPHA_CHOICES)
+                {
                     let _ = AppendMenuW(
                         sub,
                         MF_STRING | if self.alpha == v { MF_CHECKED } else { MF_UNCHECKED },
@@ -2103,7 +2114,23 @@ impl App {
                     req.x,
                 );
                 if let Some(ax) = self.auto_x_target(cluster_left) {
-                    if ax != ctx.x0 {
+                    // 目标位仍压任何窗口按钮区（含非前台的顶窗）就不原地校正，
+                    // 交给完整避让找空位——否则 snap 过去下一轮又被判遮挡躲回，
+                    // 两窗按钮簇不一致时无限乒乓
+                    let zone_free = {
+                        let mut ok = true;
+                        let mut sx = ax + ctx.max_w - 8;
+                        let sy = ctx.y + ctx.h / 2;
+                        while sx >= ax {
+                            if caption_zone_hit(sx, sy) {
+                                ok = false;
+                                break;
+                            }
+                            sx -= 24;
+                        }
+                        ok
+                    };
+                    if zone_free && ax != ctx.x0 {
                         self.pos = Some(POINT { x: ax, y: ctx.y });
                         let _ = SetWindowPos(
                             self.hwnd,
@@ -2288,7 +2315,15 @@ impl App {
                     .unwrap_or(24);
                 strip_button_cluster_left(&edge, strip_w, strip_h, cy, ctx.wa.left)
             };
-            let snap_x = self.auto_x_target(cluster_left);
+            // 贴右目标必须过与遮挡判定同一把尺子（occ）：auto_x_target 按
+            // 前台窗口的按钮簇算右界，caption_zone_hit 按该像素实际最顶的
+            // 窗口算——两窗交叠且按钮簇不同时，snap 过去立刻被 phase1 判
+            // 压按钮躲开，下一轮 snap 又贴回来，1437↔1477 无限乒乓。
+            // 目标位被任何窗口按钮区否决就原地不动，等前台/簇变化再 snap。
+            let snap_x = self.auto_x_target(cluster_left).filter(|&ax| {
+                let ox = (ax - ctx.wa.left) as usize;
+                ox + max_w as usize <= strip_w && !occ(ax)
+            });
             if let Some(ax) = snap_x {
                 if ax != ctx.left0 {
                     dest = Some(POINT { x: ax, y: ty.unwrap_or(ctx.y) });
@@ -3355,12 +3390,12 @@ unsafe extern "system" fn wndproc(
                 match wparam.0 & 0xFFFF {
                     MENU_EXIT => PostQuitMessage(0),
                     MENU_COLLAPSE => (*ptr).toggle_collapse(),
-                    MENU_ALPHA_25 => (*ptr).set_alpha(64),
-                    MENU_ALPHA_40 => (*ptr).set_alpha(102),
-                    MENU_ALPHA_55 => (*ptr).set_alpha(140),
-                    MENU_ALPHA_70 => (*ptr).set_alpha(179),
-                    MENU_ALPHA_85 => (*ptr).set_alpha(217),
-                    MENU_ALPHA_100 => (*ptr).set_alpha(255),
+                    MENU_ALPHA_25 => (*ptr).set_alpha(ALPHA_CHOICES[0]),
+                    MENU_ALPHA_40 => (*ptr).set_alpha(ALPHA_CHOICES[1]),
+                    MENU_ALPHA_55 => (*ptr).set_alpha(ALPHA_CHOICES[2]),
+                    MENU_ALPHA_70 => (*ptr).set_alpha(ALPHA_CHOICES[3]),
+                    MENU_ALPHA_85 => (*ptr).set_alpha(ALPHA_CHOICES[4]),
+                    MENU_ALPHA_100 => (*ptr).set_alpha(ALPHA_CHOICES[5]),
                     MENU_AUTOSTART => {
                         let enable = !autostart_enabled();
                         set_autostart(enable);
