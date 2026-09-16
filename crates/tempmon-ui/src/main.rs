@@ -310,6 +310,9 @@ struct App {
     last_page_rot: Option<Instant>,
     // 上次前台窗口：切换时立即解除标题栏同步门（不等 10s 轮换）
     last_fg_hwnd: isize,
+    // 连续判定为遮挡的轮数：标题栏动画（载入 spinner 等）会让遮挡判定逐帧
+    // 翻转，单轮即挪会造成左右乒乓；连续两轮才挪
+    occ_streak: u32,
     dragging: bool,
     d2d: ID2D1Factory,
     rt: ID2D1DCRenderTarget,
@@ -670,6 +673,7 @@ impl App {
                 capsule_page: 0,
                 last_page_rot: None,
                 last_fg_hwnd: 0,
+                occ_streak: 0,
                 dragging: false,
                 d2d,
                 rt,
@@ -1746,6 +1750,11 @@ impl App {
                 }
             }
             let has = has || cap_hit;
+            if has {
+                self.occ_streak = self.occ_streak.saturating_add(1);
+            } else {
+                self.occ_streak = 0;
+            }
             if in_bounds && !has {
                 self.fb_runs = 0;
                 // 未遮挡：顺路做标题栏同步 / 回归右缘的整行截取
@@ -1765,20 +1774,37 @@ impl App {
                     self.dctx = Some(DodgeCtx { ret_right: true, ..ctx });
                     let strip_x = ctx.wa.left;
                     let strip_w = ctx.wa.right - ctx.wa.left;
-                    // 沿温度计当前行截取（手动拖动后不再钉在顶部 48px 条带）
-                    if self.begin_capture(strip_x, ctx.y, strip_w, ctx.h, true, false) {
+                    // 截取自工作区顶部到温度计底缘：上半是标题栏按钮区（y 对齐锚点），
+                    // 下半含温度计当前行（遮挡评估），一次截取同时服务两者
+                    let sh = (ctx.y + ctx.h - ctx.wa.top).max(48);
+                    if self.begin_capture(strip_x, ctx.wa.top, strip_w, sh, true, false) {
+                        return;
+                    }
+                } else if self.user_pinned && sync_due {
+                    // 手动钉定：x 尊重用户，仅同步 y 到标题栏按钮带（sync=true 走
+                    // title_sync_from_strip，只修 y）
+                    let strip_x = ctx.wa.left;
+                    let strip_w = ctx.wa.right - ctx.wa.left;
+                    let sh = (ctx.y + ctx.h - ctx.wa.top).max(48);
+                    if self.begin_capture(strip_x, ctx.wa.top, strip_w, sh, false, true) {
                         return;
                     }
                 }
                 self.dctx = None;
                 return; // 常态：无遮挡
             }
-            // 确认遮挡（或超界）：固定当前位置（此后左缘锚定向右伸展），整行截取
+            // 确认遮挡（或超界）：固定当前位置（此后左缘锚定向右伸展），整行截取。
+            // 界内遮挡需连续两轮确认（动画帧噪声只出现一轮，挪了就会乒乓）
+            if in_bounds && self.occ_streak < 2 {
+                return;
+            }
+            self.occ_streak = 0;
             self.pos = Some(POINT { x: ctx.x0, y: ctx.y });
             let strip_x = ctx.wa.left;
             let strip_w = ctx.wa.right - ctx.wa.left;
-            // 沿温度计当前行截取（手动拖动后不再钉在顶部 48px 条带）
-            if !self.begin_capture(strip_x, ctx.y, strip_w, ctx.h, true, false) {
+            // 同上：顶部到温度计底缘的纵向条带
+            let sh = (ctx.y + ctx.h - ctx.wa.top).max(48);
+            if !self.begin_capture(strip_x, ctx.wa.top, strip_w, sh, true, false) {
                 self.dctx = None;
             }
             return;
@@ -1786,9 +1812,10 @@ impl App {
 
         // 第二阶段：整行边缘图上选新位置
         let Some(ctx) = self.dctx else { return };
-        // 整条截取自温度计当前行（y=ctx.y、高 ctx.h），候选评估的行带即整幅
+        // 整条截取自工作区顶部到温度计底缘；候选评估用温度计所在行带 wy0..wy0+rh，
+        // y 对齐用顶部 48px 的标题栏按钮带（strip_button_band_center_y 内部限定）
         let (strip_w, strip_h, max_w) = (req.w as usize, req.h as usize, ctx.max_w);
-        let wy0 = 0usize;
+        let wy0 = (ctx.y - ctx.wa.top).max(0) as usize;
         let rh = ctx.h as usize;
         // 内容遮挡 + 标题栏按钮区（避免挪到的新位置又压住按钮）
         let occ = |x: i32| -> bool {
@@ -1868,9 +1895,9 @@ impl App {
         // 回归右缘模式：当前未遮挡，只在完全空位中挑最靠右的（x 最大）；
         // 已在最右（无更靠右空位）则原地不动
         if ctx.ret_right {
-            // 目标 y：条带内容带中心（条带原点=ctx.y），与 x 一步到位
+            // 目标 y：标题栏按钮带中心（顶部 48px），与 x 一步到位
             let ty = strip_button_band_center_y(&edge, strip_w, strip_h)
-                .map(|c| ctx.y + c - ctx.h / 2)
+                .map(|c| ctx.wa.top + c - ctx.h / 2)
                 .map(|y| y.max(ctx.wa.top));
             let mut dest: Option<POINT> = None;
             let cd_ok = self.ret_cooldown_until.is_none_or(|t| t <= Instant::now());
@@ -1975,7 +2002,7 @@ impl App {
             self.fade_x = nx;
             // 一步到位：x 与标题栏对齐 y 同时移动，不再分两段
             self.fade_y = strip_button_band_center_y(&edge, strip_w, strip_h)
-                .map(|c| ctx.y + c - ctx.h / 2)
+                .map(|c| ctx.wa.top + c - ctx.h / 2)
                 .map(|y| y.max(ctx.wa.top))
                 .unwrap_or(ctx.y);
             self.dodging = true;
@@ -2261,22 +2288,60 @@ fn strip_content_center_y(edge: &[u8], w: usize, h: usize) -> Option<i32> {
 /// 全行加权平均会被头部任意内容（天气、标签页、页首横幅）拉偏；带取 200px
 /// 恰好覆盖三枚按钮又排除更左侧的头部元素。按钮始终贴窗口右缘，右带是锚点。
 fn strip_button_band_center_y(edge: &[u8], w: usize, h: usize) -> Option<i32> {
-    let band_w = w.min(200);
+    // 关闭按钮锚定：只看最右 80px（最小化/最大化/关闭簇恒贴窗口右上角），
+    // 自顶向下找第一个密度簇取其加权中心。
+    // 不可用全带密度峰值/加权平均：网页内容永远比稀疏的按钮字形更密，
+    // 两者都会把锚点拉进页面区域（实测 360 极速浏览器锚到第 44 行的页面横幅）
+    let band_w = w.min(80);
     let x0 = w - band_w;
     if w < 16 || h < 8 {
         return None;
     }
-    let rows = h.min(44);
-    let mut sum = 0f64;
-    let mut cnt = 0u64;
-    for y in 1..rows - 1 {
+    let rows = h.min(48);
+    let mut row_density = [0u32; 48];
+    for y in 2..rows - 1 {
         let mut c = 0u32;
         for x in x0 + 1..w - 1 {
             c += edge[y * w + x] as u32;
         }
-        if c > 0 {
-            sum += c as f64 * y as f64;
-            cnt += c as u64;
+        row_density[y] = c;
+    }
+    let peak = row_density.iter().copied().max().unwrap_or(0);
+    if peak == 0 {
+        return None;
+    }
+    // 簇阈值：峰值的 25% 且 ≥3——按钮字形行都够格，孤立噪点不够
+    let thresh = (((peak as f32) * 0.25).ceil() as u32).max(3);
+    // 自顶向下找第一个够格的行（跳过 0-1 的窗口边框线）
+    let mut y0 = None;
+    for y in 2..rows - 1 {
+        if row_density[y] >= thresh {
+            y0 = Some(y);
+            break;
+        }
+    }
+    let y0 = y0?;
+    // 簇延伸：连续 2 行低于阈值即认为簇结束
+    let mut y1 = y0;
+    let mut miss = 0u32;
+    for y in y0 + 1..rows - 1 {
+        if row_density[y] >= thresh {
+            y1 = y;
+            miss = 0;
+        } else {
+            miss += 1;
+            if miss >= 2 {
+                break;
+            }
+        }
+    }
+    let mut sum = 0f64;
+    let mut cnt = 0u64;
+    for y in y0..=y1 {
+        let c = row_density[y] as f64;
+        if c > 0.0 {
+            sum += c * y as f64;
+            cnt += row_density[y] as u64;
         }
     }
     (cnt > 0).then_some((sum / cnt as f64) as i32)
