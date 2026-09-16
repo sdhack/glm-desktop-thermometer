@@ -45,7 +45,7 @@
 
 | 段位 | 数据 | 数据源 |
 |---|---|---|
-| `CPU` | 占用率 + 温度 | PDH + WinRing0 驱动进程内读 MSR |
+| `CPU` | 占用率 + 温度 | PDH + WinRing0 进程内直读（Intel MSR / AMD SMN） |
 | `GPU` | 核心占用 + **温度** + 显存占用 | NVIDIA NVML / NVAPI / PDH / DXGI |
 | `MEM` | 内存占用率 | GlobalMemoryStatusEx |
 | `DISK` | NVMe / SATA 温度（最多 2 盘） | 存储 IOCTL 直读，失败回退 PowerShell |
@@ -299,7 +299,7 @@ GPU 空闲时 Windows 会注销 PDH 计数器实例。已内置 15 秒防抖沿�
 ├─ crates/
 │  ├─ tempmon-ui/       # UI：窗口/渲染/策略/菜单/钩子/看门狗
 │  └─ tempmon-sensor/   # 采集：PDH/DXGI/NVML/共享内存协议
-├─ ring0.rs             # CPU 温度+风扇（WinRing0 驱动进程内直读，Intel MSR + NCT SuperIO）
+├─ ring0.rs             # CPU 温度+风扇（WinRing0 进程内直读：Intel MSR / AMD SMN；Nuvoton/ITE 风扇）
 ├─ tools/               # 诊断脚本（避让检测 / 盘温验证）
 ├─ 方案.md              # 技术方案（架构/选型/风险/里程碑）
 └─ 开发记录.md          # 开发日志 + 踩坑记录

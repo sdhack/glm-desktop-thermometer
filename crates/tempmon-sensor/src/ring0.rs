@@ -277,9 +277,246 @@ fn read_banked(ma: u16, md: u16, addr: u16) -> Option<u8> {
 
 /// 采样：CPU 温度 + 最多三个风扇。任一失败都是空/None，由 UI 决定隐藏。
 pub fn sample() -> (Option<f32>, Vec<f32>) {
-    let fans = nuvoton_fans();
-    let fans = if fans.len() > 3 { fans[..3].to_vec() } else { fans };
-    (intel_package_temp(), fans)
+    let mut caps = CapLog::default();
+    let temp = match cpu_vendor() {
+        Vendor::Intel => intel_package_temp().or_else(amd_package_temp),
+        Vendor::Amd => amd_package_temp().or_else(intel_package_temp),
+        Vendor::Unknown => None,
+    };
+    caps.cpu = temp.map(|t| format!("{t:.1}"));
+    let mut fans = nuvoton_fans();
+    caps.superio = "Nuvoton".into();
+    if fans.is_empty() {
+        fans = it87_fans();
+        caps.superio = if fans.is_empty() { "IT87(无读数)".into() } else { "ITE".into() };
+    }
+    if fans.len() > 3 {
+        fans.truncate(3);
+    }
+    caps.fans = fans.iter().map(|f| format!("{f:.0}")).collect::<Vec<_>>().join("/");
+    caps.flush();
+    (temp, fans)
+}
+
+// ---------------------------------------------------------------------------
+// CPU 厂商识别（cpuid）
+// ---------------------------------------------------------------------------
+
+#[derive(PartialEq, Eq, Debug)]
+pub enum Vendor {
+    Intel,
+    Amd,
+    Unknown,
+}
+
+pub fn cpu_vendor() -> Vendor {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::__cpuid;
+        let v = __cpuid(0);
+        let buf = [v.ebx, v.edx, v.ecx];
+        let s: [u8; 12] = std::mem::transmute(buf);
+        match &s {
+            b"GenuineIntel" => Vendor::Intel,
+            b"AuthenticAMD" => Vendor::Amd,
+            _ => Vendor::Unknown,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        Vendor::Unknown
+    }
+}
+
+/// CPU 家族号（cpuid leaf1）：AMD Zen = 0x17/0x19
+fn cpu_family() -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::__cpuid;
+        let eax = __cpuid(1).eax;
+        let base = (eax >> 8) & 0xF;
+        if base == 0xF {
+            base + ((eax >> 20) & 0xFF)
+        } else {
+            base
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AMD Zen（Family 17h/19h）：SMN 经 PCI 0:0:0 寄存器 0x60(index)/0x64(data) 访问，
+// 温度 = THM_TCON_CUR_TMP(0x59800) bits 31:21 * 0.125，bit19 置位时再 -49。
+// 流程与 LibreHardwareMonitor Amd17Cpu 一致。
+// ---------------------------------------------------------------------------
+
+const IOCTL_READ_PCI_CONFIG: u32 = (40000 << 16) | (1 << 14) | (0x851 << 2); // access=Read
+const IOCTL_WRITE_PCI_CONFIG: u32 = (40000 << 16) | (2 << 14) | (0x852 << 2); // access=Write
+
+fn read_pci_dword(pci_addr: u32, reg: u32) -> Option<u32> {
+    let h = driver()?;
+    let mut out = 0u32;
+    let mut ret = 0u32;
+    let input: [u32; 2] = [pci_addr, reg];
+    unsafe {
+        DeviceIoControl(
+            h,
+            IOCTL_READ_PCI_CONFIG,
+            Some(input.as_ptr() as _),
+            8,
+            Some(&mut out as *mut u32 as _),
+            4,
+            Some(&mut ret),
+            None,
+        )
+        .ok()?;
+    }
+    Some(out)
+}
+
+fn write_pci_dword(pci_addr: u32, reg: u32, value: u32) -> Option<()> {
+    let h = driver()?;
+    let mut ret = 0u32;
+    let input: [u32; 3] = [pci_addr, reg, value];
+    unsafe {
+        DeviceIoControl(
+            h,
+            IOCTL_WRITE_PCI_CONFIG,
+            Some(input.as_ptr() as _),
+            12,
+            None,
+            0,
+            Some(&mut ret),
+            None,
+        )
+        .ok()?;
+    }
+    Some(())
+}
+
+pub fn amd_package_temp() -> Option<f32> {
+    if !matches!(cpu_vendor(), Vendor::Amd) {
+        return None;
+    }
+    let family = cpu_family();
+    if !matches!(family, 0x17 | 0x19) {
+        return None; // Zen 1-4/5(F19h)；更老的 0Fh/10h 与 Zen5(1Ah) 不支持
+    }
+    // SMN 地址写入 PCI 0:0:0 的 0x60，从 0x64 读数据
+    write_pci_dword(0, 0x60, 0x0005_9800)?;
+    let data = read_pci_dword(0, 0x64)?;
+    let temp = ((data >> 21) * 125) as f32 * 0.001 + if data & 0x8_0000 != 0 { -49.0 } else { 0.0 };
+    if (0.0..=110.0).contains(&temp) {
+        Some(temp)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ITE IT87xx 风扇（Nuvoton 不在场时兜底）。协议同 LibreHardwareMonitor
+// IT87XX：PnP 进出同 NCT，芯片 ID 在 0x20/0x21；选 LDN 0x04 读基址 0x60/0x61；
+// 监控区 index=base+5 / data=base+6（bank 0）。
+// ---------------------------------------------------------------------------
+
+pub fn it87_fans() -> Vec<f32> {
+    for (ap, vp) in [(0x2Eu16, 0x2Fu16), (0x4Eu16, 0x4Fu16)] {
+        if let Some(fans) = try_it87_fans(ap, vp) {
+            if !fans.is_empty() {
+                return fans;
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn try_it87_fans(ap: u16, vp: u16) -> Option<Vec<f32>> {
+    write_port(ap, 0x87)?;
+    write_port(ap, 0x87)?;
+    write_port(ap, 0x20)?;
+    let hi = read_port(vp)?;
+    write_port(ap, 0x21)?;
+    let lo = read_port(vp)?;
+    let chip_id = ((hi as u16) << 8) | lo as u16;
+    // 16 位转速计数器的芯片（较新的 IT86xx/87xx）；老 8 位+分频芯片先不支持
+    let has_16bit = matches!(
+        chip_id,
+        0x8613 | 0x8620 | 0x8625 | 0x8628 | 0x8631 | 0x8655 | 0x8665 | 0x8686 | 0x8688
+            | 0x8689 | 0x8695 | 0x8696 | 0x8728 | 0x8733 | 0x8790
+    );
+    if !has_16bit {
+        write_port(ap, 0xAA);
+        return None;
+    }
+    // 选 EC LDN 0x04，读 I/O 基址
+    pnp_select(ap, vp, 0x04)?;
+    let b_hi = pnp_read(ap, vp, 0x60)? as u16;
+    let b_lo = pnp_read(ap, vp, 0x61)? as u16;
+    write_port(ap, 0xAA)?; // 退出 PnP
+    let base = (b_hi << 8) | b_lo;
+    if base == 0 || base == 0xFFFF {
+        return None;
+    }
+    let (ma, md) = (base + 5, base + 6);
+    // IT87 直读寄存器（无 bank select）
+    let mut fans = Vec::new();
+    // 转速寄存器对：低字节 / 扩展(高)字节
+    for (lo_reg, hi_reg) in [(0x0Du16, 0x18u16), (0x0E, 0x19), (0x0F, 0x1A), (0x80, 0x81)] {
+        write_port(ma, lo_reg as u8)?;
+        let lo = read_port(md)? as u16;
+        write_port(ma, hi_reg as u8)?;
+        let hi = read_port(md)? as u16;
+        let value = lo | (hi << 8);
+        // >0x3F 才有效（LHM 同款门限），0xFFFF = 无扇
+        if value > 0x3F && value < 0xFFFF {
+            let rpm = 1_350_000f32 / (value * 2) as f32;
+            if (60.0..=9999.0).contains(&rpm) {
+                fans.push(rpm);
+            }
+        }
+    }
+    Some(fans)
+}
+
+// ---------------------------------------------------------------------------
+// 能力自检日志：每次启动把探测结果写到 %APPDATA%\tempmon-caps.log，
+// 供"段位为什么没显示"排查用。
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct CapLog {
+    cpu: Option<String>,
+    fans: String,
+    superio: String,
+}
+
+impl CapLog {
+    fn flush(&self) {
+        let line = format!(
+            "{} | cpu_vendor={:?} | cpu_temp={} | superio={} | fans=[{}]\n",
+            chrono_like_now(),
+            cpu_vendor(),
+            self.cpu.as_deref().unwrap_or("无"),
+            self.superio,
+            self.fans,
+        );
+        if let Ok(mut p) = std::env::var("APPDATA") {
+            p.push_str("\\tempmon-caps.log");
+            let _ = std::fs::write(p, line);
+        }
+    }
+}
+
+fn chrono_like_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // 仅用于日志排序的本地粗略时间戳（UTC 秒），避免引第三方时间库
+    format!("#epoch={secs}")
 }
 
 #[cfg(test)]
