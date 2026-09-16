@@ -2310,67 +2310,68 @@ fn strip_content_center_y(edge: &[u8], w: usize, h: usize) -> Option<i32> {
 /// 全行加权平均会被头部任意内容（天气、标签页、页首横幅）拉偏；带取 200px
 /// 恰好覆盖三枚按钮又排除更左侧的头部元素。按钮始终贴窗口右缘，右带是锚点。
 fn strip_button_band_center_y(edge: &[u8], w: usize, h: usize) -> Option<i32> {
-    // 关闭按钮锚定：只看最右 80px（最小化/最大化/关闭簇恒贴窗口右上角），
-    // 自顶向下找第一个密度簇取其加权中心。
-    // 不可用全带密度峰值/加权平均：网页内容永远比稀疏的按钮字形更密，
-    // 两者都会把锚点拉进页面区域（实测 360 极速浏览器锚到第 44 行的页面横幅）。
-    // 80px 带也会扫进关闭按钮左侧的标签栏/扩展图标把簇中心上拉 2-3px，
-    // 收窄到 48px 只含关闭按钮本身——最右、最无歧义的锚点
-    let band_w = w.min(48);
-    let x0 = w - band_w;
+    // 关闭按钮锚定：自顶向下找最右窄带里的第一个密度簇取加权中心。
+    // 带宽梯式回退：48px 只含关闭按钮（最准，360极速/微信/360文件夹都命中）；
+    // 部分程序（ZCode 等）按钮左侧留白大，48px 会空转，逐级放宽到 96/200px。
+    // 不可用全带密度峰值/加权平均：网页内容永远比按钮字形更密，两者都会把
+    // 锚点拉进页面区域（实测 360 极速浏览器锚到第 44 行的页面横幅）
     if w < 16 || h < 8 {
         return None;
     }
-    let rows = h.min(48);
-    let mut row_density = [0u32; 48];
-    for y in 2..rows - 1 {
-        let mut c = 0u32;
-        for x in x0 + 1..w - 1 {
-            c += edge[y * w + x] as u32;
+    for band_w in [48usize, 96, 200] {
+        let bw = band_w.min(w);
+        let x0 = w - bw;
+        let rows = h.min(48);
+        let mut row_density = [0u32; 48];
+        for y in 2..rows - 1 {
+            let mut c = 0u32;
+            for x in x0 + 1..w - 1 {
+                c += edge[y * w + x] as u32;
+            }
+            row_density[y] = c;
         }
-        row_density[y] = c;
-    }
-    let peak = row_density.iter().copied().max().unwrap_or(0);
-    if peak == 0 {
-        return None;
-    }
-    // 簇阈值：绝对值 5。相对峰值（25%）会被稠密的页面横幅抬高——按钮字形行
-    // （密度 14-28）达不到阈值，顶部簇直接跳到页面横幅上（实测 360 极速浏览器
-    // 锚到第 23 行）。按钮行密度 ≥5 恒定够格，孤立噪点（1-3）不够
-    let thresh = 5u32;
-    // 自顶向下找第一个够格的行（跳过 0-1 的窗口边框线）
-    let mut y0 = None;
-    for y in 2..rows - 1 {
-        if row_density[y] >= thresh {
-            y0 = Some(y);
-            break;
+        // 绝对簇阈值 5：相对峰值会被稠密的页面横幅抬高，按钮字形行
+        //（密度 14-28）大面积掉出门槛，顶部簇跳到页面横幅上
+        if row_density.iter().copied().max().unwrap_or(0) < 5 {
+            continue; // 该带宽内没有按钮簇，放宽带宽重试
         }
-    }
-    let y0 = y0?;
-    // 簇延伸：连续 2 行低于阈值即认为簇结束
-    let mut y1 = y0;
-    let mut miss = 0u32;
-    for y in y0 + 1..rows - 1 {
-        if row_density[y] >= thresh {
-            y1 = y;
-            miss = 0;
-        } else {
-            miss += 1;
-            if miss >= 2 {
+        // 自顶向下找第一个够格的行（跳过 0-1 的窗口边框线）
+        let mut y0 = None;
+        for y in 2..rows - 1 {
+            if row_density[y] >= 5 {
+                y0 = Some(y);
                 break;
             }
         }
-    }
-    let mut sum = 0f64;
-    let mut cnt = 0u64;
-    for y in y0..=y1 {
-        let c = row_density[y] as f64;
-        if c > 0.0 {
-            sum += c * y as f64;
-            cnt += row_density[y] as u64;
+        let y0 = y0?;
+        // 簇延伸：连续 2 行低于阈值即认为簇结束
+        let mut y1 = y0;
+        let mut miss = 0u32;
+        for y in y0 + 1..rows - 1 {
+            if row_density[y] >= 5 {
+                y1 = y;
+                miss = 0;
+            } else {
+                miss += 1;
+                if miss >= 2 {
+                    break;
+                }
+            }
+        }
+        let mut sum = 0f64;
+        let mut cnt = 0u64;
+        for y in y0..=y1 {
+            let c = row_density[y] as f64;
+            if c > 0.0 {
+                sum += c * y as f64;
+                cnt += row_density[y] as u64;
+            }
+        }
+        if cnt > 0 {
+            return Some((sum / cnt as f64) as i32);
         }
     }
-    (cnt > 0).then_some((sum / cnt as f64) as i32)
+    None
 }
 
 fn edge_region_stats(
