@@ -313,6 +313,9 @@ struct App {
     // 连续判定为遮挡的轮数：标题栏动画（载入 spinner 等）会让遮挡判定逐帧
     // 翻转，单轮即挪会造成左右乒乓；连续两轮才挪
     occ_streak: u32,
+    // 最近 3 次 y 对齐提议：取多数/中位，重绘空帧等单次异常不生效
+    sync_ty_hist: [i32; 3],
+    sync_ty_n: u32,
     dragging: bool,
     d2d: ID2D1Factory,
     rt: ID2D1DCRenderTarget,
@@ -674,6 +677,8 @@ impl App {
                 last_page_rot: None,
                 last_fg_hwnd: 0,
                 occ_streak: 0,
+                sync_ty_hist: [0; 3],
+                sync_ty_n: 0,
                 dragging: false,
                 d2d,
                 rt,
@@ -1626,6 +1631,9 @@ impl App {
             let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
             let fg_id = if fg.is_invalid() { 0 } else { fg.0 as isize };
             if fg_id != self.last_fg_hwnd {
+                if self.debug_on() {
+                    eprintln!("[fg-change] {:?} -> {:?} (立即触发同步)", self.last_fg_hwnd, fg_id);
+                }
                 self.last_fg_hwnd = fg_id;
                 self.last_sync_check = None;
             }
@@ -2055,9 +2063,23 @@ impl App {
                     r.top
                 );
             }
-            if d.abs() < 2 {
+            // 多数表决：新提议与最近两条历史任一一致（≥2/3）才挪。
+            // 头部动画/重绘空帧造成的一次性跳变无法凑齐 2/3，被自然滤除；
+            // 前台切到新窗口后，新按钮行的提议两次内即成多数，自动收敛
+            let agree = |a: i32, b: i32| (a - b).abs() < 2;
+            let n = self.sync_ty_n as usize;
+            let confirmed = n >= 1 && agree(self.sync_ty_hist[(n + 2) % 3], ty)
+                || n >= 2 && agree(self.sync_ty_hist[(n + 1) % 3], ty);
+            let n2 = n.min(2);
+            self.sync_ty_hist[n2] = ty;
+            self.sync_ty_n = (n + 1).min(3) as u32;
+            if !confirmed {
+                if self.debug_on() {
+                    eprintln!("[title-sync] ty={ty} 待确认 (历史 {:?})", &self.sync_ty_hist[..n2 + 1]);
+                }
                 return;
             }
+            self.sync_ty_n = 0;
             self.pos = Some(POINT { x: r.left, y: ty });
             self.fade_x = r.left;
             self.fade_y = ty;
@@ -2291,8 +2313,10 @@ fn strip_button_band_center_y(edge: &[u8], w: usize, h: usize) -> Option<i32> {
     // 关闭按钮锚定：只看最右 80px（最小化/最大化/关闭簇恒贴窗口右上角），
     // 自顶向下找第一个密度簇取其加权中心。
     // 不可用全带密度峰值/加权平均：网页内容永远比稀疏的按钮字形更密，
-    // 两者都会把锚点拉进页面区域（实测 360 极速浏览器锚到第 44 行的页面横幅）
-    let band_w = w.min(80);
+    // 两者都会把锚点拉进页面区域（实测 360 极速浏览器锚到第 44 行的页面横幅）。
+    // 80px 带也会扫进关闭按钮左侧的标签栏/扩展图标把簇中心上拉 2-3px，
+    // 收窄到 48px 只含关闭按钮本身——最右、最无歧义的锚点
+    let band_w = w.min(48);
     let x0 = w - band_w;
     if w < 16 || h < 8 {
         return None;
@@ -2310,8 +2334,10 @@ fn strip_button_band_center_y(edge: &[u8], w: usize, h: usize) -> Option<i32> {
     if peak == 0 {
         return None;
     }
-    // 簇阈值：峰值的 25% 且 ≥3——按钮字形行都够格，孤立噪点不够
-    let thresh = (((peak as f32) * 0.25).ceil() as u32).max(3);
+    // 簇阈值：绝对值 5。相对峰值（25%）会被稠密的页面横幅抬高——按钮字形行
+    // （密度 14-28）达不到阈值，顶部簇直接跳到页面横幅上（实测 360 极速浏览器
+    // 锚到第 23 行）。按钮行密度 ≥5 恒定够格，孤立噪点（1-3）不够
+    let thresh = 5u32;
     // 自顶向下找第一个够格的行（跳过 0-1 的窗口边框线）
     let mut y0 = None;
     for y in 2..rows - 1 {
