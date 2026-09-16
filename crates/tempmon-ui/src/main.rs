@@ -308,6 +308,8 @@ struct App {
     capsule_page: u32,
     // 上次胶囊翻页时刻：按真实时间翻页；避让动画的 16ms 手动 tick 不再加速轮换
     last_page_rot: Option<Instant>,
+    // 上次前台窗口：切换时立即解除标题栏同步门（不等 10s 轮换）
+    last_fg_hwnd: isize,
     dragging: bool,
     d2d: ID2D1Factory,
     rt: ID2D1DCRenderTarget,
@@ -667,6 +669,7 @@ impl App {
                 h_fans: Hold::default(),
                 capsule_page: 0,
                 last_page_rot: None,
+                last_fg_hwnd: 0,
                 dragging: false,
                 d2d,
                 rt,
@@ -1614,6 +1617,15 @@ impl App {
         if debug {
             eprintln!("[{}] [dodge] check at +{:.1}s", wallclock(), (Instant::now() - self.started_at).as_secs_f32());
         }
+        // 前台窗口切换 → 立即允许标题栏同步（burst 定时器 0.3s 内响应）
+        unsafe {
+            let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+            let fg_id = if fg.is_invalid() { 0 } else { fg.0 as isize };
+            if fg_id != self.last_fg_hwnd {
+                self.last_fg_hwnd = fg_id;
+                self.last_sync_check = None;
+            }
+        }
         // 节流：两次实际检测至少间隔 700ms（事件风暴/多来源触发时合并）
         let now_ms = START_MS
             .get_or_init(std::time::Instant::now)
@@ -1674,6 +1686,7 @@ impl App {
         let Some(req) = self.cap.take() else { return };
         let Some(px) = self.finish_capture(req.x, req.y, req.w, req.h, req.excluded, req.hidden)
         else {
+            if self.debug_on() { eprintln!("[capture] grab FAILED at ({},{}) {}x{}", req.x, req.y, req.w, req.h); }
             return;
         };
         // 调试：转储检测画面
@@ -1692,7 +1705,10 @@ impl App {
             let name = if req.full { "cap_full.bmp" } else { "cap_cur.bmp" };
             let _ = std::fs::write(format!("D:/GLM桌面温度计260912/tools/{}", name), &data);
         }
-        let Some(edge) = compute_edge_map(&px, req.w as usize, req.h as usize) else { return };
+        let Some(edge) = compute_edge_map(&px, req.w as usize, req.h as usize) else {
+            if dump { eprintln!("[capture] edge_map FAILED w={} h={} px={}", req.w, req.h, px.len()); }
+            return;
+        };
         if req.sync {
             self.title_sync_from_strip(&edge, &req);
             return;
@@ -1850,8 +1866,8 @@ impl App {
         // 回归右缘模式：当前未遮挡，只在完全空位中挑最靠右的（x 最大）；
         // 已在最右（无更靠右空位）则原地不动
         if ctx.ret_right {
-            // 目标 y：条带内容带中心（左右内容都参与定位），与 x 一步到位
-            let ty = strip_content_center_y(&edge, strip_w, strip_h)
+            // 目标 y：标题栏按钮带中心（右缘 400px），与 x 一步到位
+            let ty = strip_button_band_center_y(&edge, strip_w, strip_h)
                 .map(|c| ctx.wa.top + c - ctx.h / 2)
                 .map(|y| y.max(ctx.wa.top));
             let mut dest: Option<POINT> = None;
@@ -1955,7 +1971,7 @@ impl App {
             self.fb_runs = if fallback { self.fb_runs + 1 } else { 0 };
             self.fade_x = nx;
             // 一步到位：x 与标题栏对齐 y 同时移动，不再分两段
-            self.fade_y = strip_content_center_y(&edge, strip_w, strip_h)
+            self.fade_y = strip_button_band_center_y(&edge, strip_w, strip_h)
                 .map(|c| ctx.wa.top + c - ctx.h / 2)
                 .map(|y| y.max(ctx.wa.top))
                 .unwrap_or(ctx.y);
@@ -1975,9 +1991,12 @@ impl App {
     /// 按钮行表现为一条水平密集带；取带中心，把温度计垂直居中对齐过去。
     /// 只在明显偏移（>3px）时移动；移动后 10s 内不重复同步
     fn title_sync_from_strip(&mut self, edge: &[u8], req: &CapReq) {
+        if self.debug_on() {
+            eprintln!("[title-sync] enter w={} h={} edge_len={}", req.w, req.h, edge.len());
+        }
         let w = req.w as usize;
         let h = req.h as usize;
-        let Some(cy) = strip_content_center_y(edge, w, h) else {
+        let Some(cy) = strip_button_band_center_y(edge, w, h) else {
             if self.debug_on() {
                 eprintln!("[title-sync] strip has no content rows");
             }
@@ -2225,6 +2244,31 @@ fn strip_content_center_y(edge: &[u8], w: usize, h: usize) -> Option<i32> {
     for y in 1..rows - 1 {
         let mut c = 0u32;
         for x in 1..w - 1 {
+            c += edge[y * w + x] as u32;
+        }
+        if c > 0 {
+            sum += c as f64 * y as f64;
+            cnt += c as u64;
+        }
+    }
+    (cnt > 0).then_some((sum / cnt as f64) as i32)
+}
+
+/// 标题栏按钮带中心：只统计条带最右 400px 的内容（最小化/最大化/关闭按钮及
+/// 相邻头部元素所在区域）。全行加权平均会被头部任意内容（天气、标签页、
+/// 页首横幅）拉偏，按钮始终贴着窗口右缘，右带才是稳定锚点。
+fn strip_button_band_center_y(edge: &[u8], w: usize, h: usize) -> Option<i32> {
+    let band_w = w.min(400);
+    let x0 = w - band_w;
+    if w < 16 || h < 8 {
+        return None;
+    }
+    let rows = h.min(44);
+    let mut sum = 0f64;
+    let mut cnt = 0u64;
+    for y in 1..rows - 1 {
+        let mut c = 0u32;
+        for x in x0 + 1..w - 1 {
             c += edge[y * w + x] as u32;
         }
         if c > 0 {
