@@ -221,6 +221,29 @@ cp bin/Release/net8.0/win-x64/publish/* ../../target/release/
 
 ## 📋 更新日志
 
+<details open>
+<summary><b>v1.3.0 · 原生直读 + 兼容面大版本</b></summary>
+
+**架构**
+- ⚡ **干掉 .NET 桥接进程**：Rust 经 WinRing0 驱动进程内直读 CPU 温度与风扇，
+  三进程 → 双进程，常驻内存 ~110MB → **~40MB**（UI 脏检查渲染再省一半）
+- 🧭 **CPU 温度支持 Intel + AMD Ryzen**（MSR / SMN 双路径，按 cpuid 自动选）
+- 🌀 **风扇支持 Nuvoton + ITE** 两大 SuperIO 家族兜底
+- 📝 启动写能力自检日志（%APPDATA%	empmon-caps.log），段位隐藏可排查
+
+**修复**
+- 🩹 自绘标题栏（微信内置浏览器等）与系统按钮不平齐：对齐锚点改为右缘
+  按钮带中心（最右 200px），不再被天气组件/页首横幅拉偏
+- 🩹 切换窗口后 y 长期停留旧值（10s 同步门 + 30s 避让冷却）：前台切换立即
+  触发同步，1s 内对齐；y 死区 3-4px 收紧到 2px
+- 🩹 移动温度计时宽度反复伸缩：胶囊翻页按 tick 计数被避让动画的 16ms 手动
+  tick 加速轮换，改 Instant 真实时间计时，动画期间冻结翻页
+
+**界面**
+- 🎚️ 透明度菜单 4 级 → 6 级（25/40/55/70/85/100%）
+
+</details>
+
 <details>
 <summary><b>v1.2.0 · 稳定性大版本</b></summary>
 
