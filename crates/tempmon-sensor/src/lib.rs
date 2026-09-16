@@ -17,7 +17,7 @@ use windows::Win32::System::Performance::{
 };
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Snapshot {
     pub cpu_usage: f32,
     pub mem_used_gb: f32,

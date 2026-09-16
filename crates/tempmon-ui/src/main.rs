@@ -326,6 +326,8 @@ struct App {
     widest: i32,
     last_checked_w: i32,
     rendered_once: bool,
+    // 上次成功渲染的（快照, 胶囊页, 透明度）：全都没变且无动画时跳过整帧 D2D 排版重绘
+    last_rendered: Option<(Snapshot, u32, u8)>,
     dodge_secs: u32,
     user_pinned: bool,
     started_at: Instant,
@@ -683,6 +685,7 @@ impl App {
         widest: 0,
         last_checked_w: 0,
         rendered_once: false,
+        last_rendered: None,
         dodge_secs: cfg.dodge_secs,
         user_pinned: cfg.pinned,
         started_at: Instant::now(),
@@ -861,6 +864,15 @@ impl App {
         snap.cpu_temp = hold(&mut self.h_cpu_temp, snap.cpu_temp);
         snap.disk_temps = self.h_disk.set_vec(snap.disk_temps);
         snap.fans = self.h_fans.set_vec(snap.fans);
+        // 脏检查：数值、页码、透明度、隐藏态全都没变且避让动画不在进行时，
+        // 跳过整帧排版+重绘（温度数据 1s 才动一点，多数 tick 是纯浪费）
+        if self.fade_phase == 0
+            && !self.hidden
+            && self.last_rendered.as_ref() == Some(&(snap.clone(), self.capsule_page, self.alpha))
+        {
+            return Ok(());
+        }
+        self.last_rendered = Some((snap.clone(), self.capsule_page, self.alpha));
         self.render(&snap)
     }
 
