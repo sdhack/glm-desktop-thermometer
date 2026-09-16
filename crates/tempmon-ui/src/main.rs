@@ -1884,9 +1884,10 @@ impl App {
                 }
             }
             if dest.is_none() {
-                // x 已在最右：只修 y 偏差
+                // x 已在最右：只修 y 偏差（≥2px 即修：浏览器标题栏高度差
+                // 往往只有两三像素，死区大了用户肉眼可见不对齐）
                 if let Some(y) = ty {
-                    if (y - ctx.y).abs() > 3 {
+                    if (y - ctx.y).abs() >= 2 {
                         dest = Some(POINT { x: ctx.left0, y });
                     }
                 }
@@ -2025,7 +2026,7 @@ impl App {
                     r.top
                 );
             }
-            if d.abs() <= 4 {
+            if d.abs() < 2 {
                 return;
             }
             self.pos = Some(POINT { x: r.left, y: ty });
@@ -2254,11 +2255,11 @@ fn strip_content_center_y(edge: &[u8], w: usize, h: usize) -> Option<i32> {
     (cnt > 0).then_some((sum / cnt as f64) as i32)
 }
 
-/// 标题栏按钮带中心：只统计条带最右 400px 的内容（最小化/最大化/关闭按钮及
-/// 相邻头部元素所在区域）。全行加权平均会被头部任意内容（天气、标签页、
-/// 页首横幅）拉偏，按钮始终贴着窗口右缘，右带才是稳定锚点。
+/// 标题栏按钮带中心：只统计条带最右 200px（最小化/最大化/关闭按钮簇）的内容。
+/// 全行加权平均会被头部任意内容（天气、标签页、页首横幅）拉偏；带取 200px
+/// 恰好覆盖三枚按钮又排除更左侧的头部元素。按钮始终贴窗口右缘，右带是锚点。
 fn strip_button_band_center_y(edge: &[u8], w: usize, h: usize) -> Option<i32> {
-    let band_w = w.min(400);
+    let band_w = w.min(200);
     let x0 = w - band_w;
     if w < 16 || h < 8 {
         return None;
