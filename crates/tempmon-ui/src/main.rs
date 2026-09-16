@@ -49,7 +49,13 @@ use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{
     CreateFileMappingW, MapViewOfFile, FILE_MAP_READ, PAGE_READWRITE,
 };
-use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+use windows::Win32::System::Variant::VARIANT;
+use windows::Win32::UI::Accessibility::{
+    CUIAutomation, IUIAutomation, IUIAutomationElement, HWINEVENTHOOK, SetWinEventHook,
+    TreeScope_Children, TreeScope_Descendants, UIA_ButtonControlTypeId, UIA_ControlTypePropertyId,
+    UIA_NamePropertyId,
+};
 use windows::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -132,6 +138,7 @@ const MENU_ALPHA_85: usize = 203;
 const MENU_ALPHA_100: usize = 204;
 const MENU_AUTOSTART: usize = 210;
 const MENU_RESET_POS: usize = 220;
+const MENU_PIN: usize = 225;
 const MENU_CAPSULE_BASE: usize = 230;
 const MENU_ROW_BASE: usize = 250;
 const MENU_ROTATE_BASE: usize = 260;
@@ -144,6 +151,11 @@ const WM_APP_DODGE: u32 = WM_APP + 3;
 const APP_NAME: &str = "TempmonWidget";
 
 const EDGE_MARGIN: f32 = 8.0;
+/// UIA 按钮簇左缘之外的安全间距：簇矩形不含分隔线与图标溢出，
+/// 留得太小时胶囊会贴到 1px 缝（用户看到的"压着按钮"）
+const CAPTION_GAP: i32 = 32;
+/// UIA 不可信时按标准三按钮 + 间距预留（24px 小按钮风格簇从 159px 起）
+const CAPTION_FALLBACK: i32 = 190;
 const FONT_PX: f32 = 13.0;
 const BAR_H: f32 = 24.0;
 const CAP_H: f32 = 24.0;
@@ -180,6 +192,198 @@ static DODGE_EVENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 static START_MS: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 // 上次避让检测的时刻（相对 START_MS 的毫秒数），节流窗口 DODGE_THROTTLE_MS
 static DODGE_LAST_CHECK_MS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+// ── UIA 标题栏按钮对齐 ──
+//
+// 用 UI Automation 读取前台窗口"关闭"按钮的真实矩形，y 中心做对齐锚点；
+// 查不到（元素不暴露/超时）时回退 strip_button_band_center_y 截图启发式。
+// UIA 树遍历可能几十~几百 ms，禁止在 UI 线程同步调：独立线程查询，
+// 结果写 UIA_CACHE，主线程只读。
+
+/// 前台 hwnd → (按钮行 y 中心, 按钮簇左缘, 时刻)。y == i32::MIN 表示该窗口
+/// 查过但 UIA 拿不到按钮（成功 TTL 60s，失败 TTL 10s，到期后允许重试）
+static UIA_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<isize, (i32, i32, Instant)>>> =
+    std::sync::OnceLock::new();
+
+fn uia_cache() -> std::sync::MutexGuard<'static, std::collections::HashMap<isize, (i32, i32, Instant)>> {
+    UIA_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+// 查询工作线程互斥：同一时刻最多一个 UIA 查询在跑
+static UIA_WORKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 请求后台查询前台 hwnd 的标题栏按钮行。
+/// force=true 用于前台切换：强制重新查询——窗口在后台期间布局可能已变
+/// （如浏览器切换标签页显隐 tab 条，按钮行会移动），旧锚点不可信
+fn uia_ensure_request(hwnd_id: isize, force: bool) {
+    if hwnd_id == 0 {
+        return;
+    }
+    if !force {
+        let map = uia_cache();
+        if let Some(&(y, _, t)) = map.get(&hwnd_id) {
+            let ttl = if y == i32::MIN { 10 } else { 60 };
+            if t.elapsed() < std::time::Duration::from_secs(ttl) {
+                return; // 缓存新鲜
+            }
+        }
+    }
+    if UIA_WORKING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let debug = std::env::var("TEMPMON_DODGE_DEBUG").is_ok();
+    let res = std::thread::Builder::new().name("uia-close-btn".into()).spawn(move || {
+        let mut anchor = unsafe { uia_query_caption_row(HWND(hwnd_id as _)) }.unwrap_or((i32::MIN, i32::MIN));
+        if force {
+            // Chromium 系窗口的 UIA 矩形对布局变更滞后一次：强制刷新时
+            // 隔 250ms 采第二次，取较新的结果
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            if let Some(a2) = unsafe { uia_query_caption_row(HWND(hwnd_id as _)) } {
+                anchor = a2;
+            }
+        }
+        if debug {
+            eprintln!("[uia] hwnd={hwnd_id:#x} y={} zone_left={}",
+                if anchor.0 == i32::MIN { "无".into() } else { anchor.0.to_string() },
+                if anchor.1 == i32::MIN { "无".into() } else { anchor.1.to_string() });
+        }
+        uia_cache().insert(hwnd_id, (anchor.0, anchor.1, Instant::now()));
+        UIA_WORKING.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+    if res.is_err() {
+        UIA_WORKING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 读缓存：返回前台窗口标题栏按钮行的 (y 中心, 按钮簇左缘)；无值/过期返回 None 并顺路请求刷新
+fn uia_cached_anchor(hwnd_id: isize) -> Option<(i32, i32)> {
+    if hwnd_id == 0 {
+        return None;
+    }
+    let fresh = {
+        let map = uia_cache();
+        match map.get(&hwnd_id) {
+            Some(&(y, zl, t)) => {
+                let ttl = if y == i32::MIN { 10 } else { 60 };
+                if t.elapsed() < std::time::Duration::from_secs(ttl) && y != i32::MIN {
+                    Some((y, zl))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    };
+    if fresh.is_none() {
+        uia_ensure_request(hwnd_id, false);
+    }
+    fresh
+}
+
+/// y 中心便捷读取
+fn uia_cached_close_y(hwnd_id: isize) -> Option<i32> {
+    uia_cached_anchor(hwnd_id).map(|(y, _)| y)
+}
+
+/// 缓存三态：Ready 查到真实锚点 / Failed 该窗口 UIA 拿不到 / Pending 还在查。
+/// Pending 时调用方应不动作（避免先按估算值跳一次、再按真实值跳第二次）
+enum AnchorState {
+    Ready(i32, i32),
+    Failed,
+    Pending,
+}
+
+fn uia_anchor_state(hwnd_id: isize) -> AnchorState {
+    if hwnd_id == 0 {
+        return AnchorState::Failed;
+    }
+    let st = {
+        let map = uia_cache();
+        match map.get(&hwnd_id) {
+            Some(&(y, zl, t)) => {
+                let ttl = if y == i32::MIN { 10 } else { 60 };
+                if t.elapsed() >= std::time::Duration::from_secs(ttl) {
+                    AnchorState::Pending
+                } else if y == i32::MIN {
+                    AnchorState::Failed
+                } else {
+                    AnchorState::Ready(y, zl)
+                }
+            }
+            None => AnchorState::Pending,
+        }
+    };
+    if matches!(st, AnchorState::Pending) {
+        uia_ensure_request(hwnd_id, false);
+    }
+    st
+}
+
+/// UIA 查询标题栏按钮行：右上角区域里的 Button 簇。
+/// 锚点优先 Name=="关闭"/"Close"（浏览器标签页同名按钮会被区域校验排除），
+/// 否则取最右一枚；簇 = 与锚点同行（|y 差| ≤ 15px）的按钮。
+/// 返回 (行 y 中心, 簇左缘)。簇左缘用于胶囊贴右时预留整个按钮区——
+/// ZCode 等应用标题栏除标准三枚外还有附加按钮，固定预留 160px 会压住它们。
+unsafe fn uia_query_caption_row(hwnd: HWND) -> Option<(i32, i32)> {
+    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    let automation: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
+    let root = automation.ElementFromHandle(hwnd).ok()?;
+    let mut wr = RECT::default();
+    if GetWindowRect(hwnd, &mut wr).is_err() {
+        return None;
+    }
+    let type_cond = automation
+        .CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_ButtonControlTypeId.0))
+        .ok()?;
+    let all = root.FindAll(TreeScope_Descendants, &type_cond).ok()?;
+    let debug = std::env::var("TEMPMON_DODGE_DEBUG").is_ok();
+    // 收集右上角区域的按钮（区域限定排除文档内容区的普通按钮）
+    let mut cands: Vec<(i32, i32, i32, i32, String)> = Vec::new(); // (left, top, w, h, name)
+    let n = all.Length().unwrap_or(0).max(0);
+    for i in 0..n {
+        let Ok(btn) = all.GetElement(i) else { continue };
+        let Ok(r) = btn.CurrentBoundingRectangle() else { continue };
+        let (bx, by, bw, bh) = (r.left, r.top, r.right - r.left, r.bottom - r.top);
+        if bx <= wr.right - 300 || by >= wr.top + 60 || bw > 80 || bh > 60 {
+            continue;
+        }
+        let name = btn.CurrentName().unwrap_or_default();
+        if debug {
+            eprintln!("[uia-cand] name={name:?} x={bx} y={by} w={bw} h={bh}");
+        }
+        cands.push((bx, by, bw, bh, name.to_string()));
+    }
+    if cands.is_empty() {
+        return None;
+    }
+    // 锚点：优先命名的关闭按钮，否则最右一枚
+    let anchor = cands
+        .iter()
+        .find(|(_, _, _, _, nm)| nm == "关闭" || nm.eq_ignore_ascii_case("close"))
+        .or_else(|| cands.iter().max_by_key(|(bx, _, _, _, _)| *bx))?;
+    // 过期矩形检测：真实 Win11 标题栏按钮宽 ≥40px（46px@100%DPI）。
+    // Chromium 系窗口布局变更后 UIA 树会滞后报旧版 24px 小按钮——
+    // y 恰好接近骗得过交叉校验，但 x 簇边界被算短、胶囊压住真实按钮。
+    // 锚点按钮过小即判不可信，整体回退截图启发式 + 160px 预留
+    if anchor.2 <= 32 || anchor.3 <= 32 {
+        if debug {
+            eprintln!("[uia-stale] 锚点按钮 {}x{} 过小（UIA 过期矩形），弃用", anchor.2, anchor.3);
+        }
+        return None;
+    }
+    let row_y = anchor.1 + anchor.3 / 2;
+    // 簇：与锚点同行的按钮，取最左左缘
+    let zone_left = cands
+        .iter()
+        .filter(|(_, by, _, bh, _)| ((by + bh / 2) - row_y).abs() <= 15)
+        .map(|(bx, _, _, _, _)| *bx)
+        .min()?;
+    Some((row_y, zone_left))
+}
+
+
 
 // ── 防抖 ──
 
@@ -273,6 +477,7 @@ struct Config {
     bg_mode: u8,
     dodge_secs: u32,
     pinned: bool,
+    widest: i32,
 }
 
 struct App {
@@ -310,6 +515,9 @@ struct App {
     last_page_rot: Option<Instant>,
     // 上次前台窗口：切换时立即解除标题栏同步门（不等 10s 轮换）
     last_fg_hwnd: isize,
+    /// UIA 锚点与截图启发式差 >6px 的窗口：UIA 矩形过期（Chromium 树滞后），
+    /// 该窗口在 TTL 内改用截图启发式（y 与 x 预留都退到 160px 估算）
+    uia_distrust: Option<(isize, Instant)>,
     // 连续判定为遮挡的轮数：标题栏动画（载入 spinner 等）会让遮挡判定逐帧
     // 翻转，单轮即挪会造成左右乒乓；连续两轮才挪
     occ_streak: u32,
@@ -370,6 +578,7 @@ fn load_config() -> Config {
         bg_mode: 0,
         dodge_secs: 1,
         pinned: false,
+        widest: 0,
     };
     if let Some(p) = config_path() {
         if let Ok(text) = std::fs::read_to_string(p) {
@@ -391,6 +600,7 @@ fn load_config() -> Config {
                         cfg.dodge_secs = if v == 0 { 0 } else { 1 }
                     }
                     ("pinned", Ok(b)) => cfg.pinned = b != 0,
+                    ("widest", Ok(n)) => cfg.widest = n,
                     ("x", Ok(x)) => {
                         cfg.pos = Some(POINT { x, y: cfg.pos.map(|q| q.y).unwrap_or(0) })
                     }
@@ -584,6 +794,10 @@ fn main() -> windows::core::Result<()> {
             );
         }
         (*ptr).tick()?;
+        // 显示前预定位（在首次渲染后，窗口宽度已定）：同步等一次 UIA 查询
+        // （启动仅此一次），窗口一出现就在"最靠右 + 标题栏对齐"的位置上，
+        // 不再"先出现在旧位置、几秒后才挪过去"
+        unsafe { (*ptr).initial_place() };
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         SetTimer(Some(hwnd), TIMER_ID, (*ptr).refresh_ms, None);
 
@@ -676,6 +890,7 @@ impl App {
                 capsule_page: 0,
                 last_page_rot: None,
                 last_fg_hwnd: 0,
+                uia_distrust: None,
                 occ_streak: 0,
                 sync_ty_hist: [0; 3],
                 sync_ty_n: 0,
@@ -697,7 +912,7 @@ impl App {
         fade_y: 0,
         dodging: false,
         last_dodge: None,
-        widest: 0,
+        widest: cfg.widest,
         last_checked_w: 0,
         rendered_once: false,
         last_rendered: None,
@@ -1517,6 +1732,12 @@ impl App {
                 MENU_RESET_POS,
                 w!("恢复吸附右上角"),
             );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING | if self.user_pinned { MF_CHECKED } else { MF_UNCHECKED },
+                MENU_PIN,
+                w!("固定位置"),
+            );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("退出"));
 
@@ -1636,6 +1857,11 @@ impl App {
                 }
                 self.last_fg_hwnd = fg_id;
                 self.last_sync_check = None;
+                // 目标窗口变了：旧布局下的回归/避让冷却失去意义，清掉，
+                // 否则避让移动后 30s 内的前台切换会被挡住贴右（x 卡在旧位）
+                self.ret_cooldown_until = None;
+                // 前台切换即后台发起 UIA 按钮查询，2s 内缓存可用
+                uia_ensure_request(fg_id, true);
             }
         }
         // 节流：两次实际检测至少间隔 700ms（事件风暴/多来源触发时合并）
@@ -1681,6 +1907,99 @@ impl App {
                 self.dctx = None;
             }
         }
+    }
+
+    /// 自动模式的最靠右 x：贴着前台窗口标题栏按钮区左侧，
+    /// 不压最小化/最大化/关闭按钮。前台窗口不够宽（小窗口）时不约束。
+    unsafe fn auto_x_target(&self, cluster_left: Option<i32>) -> Option<i32> {
+        if self.user_pinned {
+            return None;
+        }
+        let fg = HWND(self.last_fg_hwnd as _);
+        if self.last_fg_hwnd == 0 {
+            return None;
+        }
+        let mut fr = RECT::default();
+        if GetWindowRect(fg, &mut fr).is_err() {
+            return None;
+        }
+        let mut wr = RECT::default();
+        if GetWindowRect(self.hwnd, &mut wr).is_err() {
+            return None;
+        }
+        let mut wa = RECT::default();
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut wa as *mut RECT as _),
+            windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        // 前台窗口太窄（<60% 屏宽）时不贴它，保持常规选位
+        if fr.right - fr.left < (wa.right - wa.left) * 3 / 5 {
+            return None;
+        }
+        // 用最大页宽定位：轮播时窗口宽度在页间变化，若按当前宽算 x，
+        // 每次翻页都会左右挪一下；按最宽页锁定左缘后 x 稳定不动
+        let w = self.widest.max(wr.right - wr.left);
+        // 贴按钮簇左缘（UIA 枚举的真实边界，ZCode 等应用附加按钮也在内）。
+        // 查询还在跑（Pending）时不动——先按估算值跳一次、再按真实值跳一次
+        // 就是"跳两跳"的来源；查询确认失败才退回标准三按钮的 160px 估算
+        // UIA 不可信（过期矩形被判弃用/查不到）时优先用边缘图扫出的真实
+        // 簇左缘；固定预留只作扫描失败的兜底
+        let fb = || {
+            cluster_left
+                .map(|cl| (cl - 24).max(fr.right - 320))
+                .unwrap_or(fr.right - CAPTION_FALLBACK)
+        };
+        let right_limit = if self.uia_distrusted() {
+            fb()
+        } else {
+            match uia_anchor_state(self.last_fg_hwnd) {
+                AnchorState::Ready(_, zone_left) => zone_left - CAPTION_GAP,
+                AnchorState::Failed => fb(),
+                AnchorState::Pending => return None,
+            }
+        };
+        let x = right_limit - w;
+        (x >= wa.left).then_some(x)
+    }
+
+    /// 启动预定位：非固定位置时，窗口显示前就把 y 对齐到前台窗口标题栏
+    /// 按钮（同步等待 UIA 查询至多 ~400ms，超时则沿用旧位置由后续同步修正）
+    unsafe fn initial_place(&mut self) {
+        if self.user_pinned {
+            return; // 固定位置：尊重保存的坐标
+        }
+        let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+        let fg_id = if fg.is_invalid() { 0 } else { fg.0 as isize };
+        self.last_fg_hwnd = fg_id;
+        uia_ensure_request(fg_id, true);
+        // 最多等 1s（Electron/Chromium 树遍历可能数百 ms）：等到结论再落位，
+        // 显示后一步到位，避免"先按估算落位、查询返回后再修"的二次跳动
+        for _ in 0..50 {
+            match uia_anchor_state(fg_id) {
+                AnchorState::Pending => std::thread::sleep(std::time::Duration::from_millis(20)),
+                _ => break,
+            }
+        }
+        let Some((anchor, _zone_left)) = uia_cached_anchor(fg_id) else {
+            return; // UIA 查不到（如刚开机壳窗口）：保持旧行为
+        };
+        let mut wa = RECT::default();
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut wa as *mut RECT as _),
+            windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        let bar_h = if self.collapsed { CAP_H } else { BAR_H };
+        let h = (bar_h as f32 * self.scale).ceil() as i32;
+        let y = (anchor - h / 2).max(wa.top);
+        // x 取"最靠右"目标；取不到（小窗口前台）时沿用保存的 x
+        let x = self.auto_x_target(None).or_else(|| self.pos.map(|p| p.x))
+            .unwrap_or(wa.right - 420);
+        self.pos = Some(POINT { x, y });
+        SetWindowPos(self.hwnd, Some(HWND_TOPMOST), x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
     fn debug_on(&self) -> bool {
@@ -1729,8 +2048,14 @@ impl App {
             // 第一阶段：当前占位是否压住内容；边界超界也进入重选流程
             let Some(ctx) = self.dctx else { return };
             let in_bounds = ctx.left0 >= ctx.wa.left && ctx.left0 + ctx.cur_w <= ctx.wa.right;
-            let stats =
-                edge_region_stats(&edge, req.w as usize, req.h as usize, 0, req.w as usize, 0, req.h as usize);
+            // 前台窗口自己的标题栏条带不算内容遮挡（贴右缘跟随必然覆盖标题
+            // 文字），按钮区仍由 caption_zone_hit 判定
+            let cap_only = in_caption_strip_of_window_at(ctx.x0, ctx.y, ctx.cur_w, ctx.h);
+            let stats = if cap_only {
+                None
+            } else {
+                edge_region_stats(&edge, req.w as usize, req.h as usize, 0, req.w as usize, 0, req.h as usize)
+            };
             if dump {
                 eprintln!("[dodge] phase1 w={} stats={:?}", req.w, stats);
             }
@@ -1747,9 +2072,11 @@ impl App {
             // 细线图标的边缘密度注定低于内容阈值
             let mut cap_hit = false;
             if !has {
-                let mut sx = req.x + req.w - 8;
+                // 采样胶囊真实右缘（ctx.x0..+cur_w）——截取矩形外扩了 16px，
+                // 按 req.w 采样会探到胶囊外，在贴右边界处误报"压按钮"空转
+                let mut sx = ctx.x0 + ctx.cur_w - 8;
                 let sy = req.y + req.h / 2;
-                while sx >= req.x {
+                while sx >= ctx.x0 {
                     if caption_zone_hit(sx, sy) {
                         cap_hit = true;
                         break;
@@ -1758,6 +2085,42 @@ impl App {
                 }
             }
             let has = has || cap_hit;
+            if dump {
+                eprintln!(
+                    "[dodge] phase1 cap_only={} has={} cap_hit={} at ({},{})",
+                    cap_only, has, cap_hit, ctx.x0, ctx.y
+                );
+            }
+            // 仅压住按钮区（多因页宽增长右缘探进按钮区）：自动模式直接
+            // 原地校正 x 到贴右目标位，不走完整避让流程——否则会跳到
+            // 任意空位再被 snap 修回，表现为连续跳动
+            if cap_hit && !self.user_pinned {
+                let cluster_left = strip_button_cluster_left(
+                    &edge,
+                    req.w as usize,
+                    req.h as usize,
+                    (req.h / 2) as usize,
+                    req.x,
+                );
+                if let Some(ax) = self.auto_x_target(cluster_left) {
+                    if ax != ctx.x0 {
+                        self.pos = Some(POINT { x: ax, y: ctx.y });
+                        let _ = SetWindowPos(
+                            self.hwnd,
+                            Some(HWND_TOPMOST),
+                            ax,
+                            ctx.y,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                        if self.debug_on() {
+                            eprintln!("[cap-fix] {} -> {ax}", ctx.x0);
+                        }
+                        return;
+                    }
+                }
+            }
             if has {
                 self.occ_streak = self.occ_streak.saturating_add(1);
             } else {
@@ -1820,6 +2183,11 @@ impl App {
 
         // 第二阶段：整行边缘图上选新位置
         let Some(ctx) = self.dctx else { return };
+        // UIA 查询未出结论时不做任何选位/移动：等 burst 下一轮再定位，
+        // 避免"先按估算值跳一次、查询返回后再修正"的多段跳动
+        if !self.user_pinned && matches!(uia_anchor_state(self.last_fg_hwnd), AnchorState::Pending) {
+            return;
+        }
         // 整条截取自工作区顶部到温度计底缘；候选评估用温度计所在行带 wy0..wy0+rh，
         // y 对齐用顶部 48px 的标题栏按钮带（strip_button_band_center_y 内部限定）
         let (strip_w, strip_h, max_w) = (req.w as usize, req.h as usize, ctx.max_w);
@@ -1831,7 +2199,10 @@ impl App {
             if ox + max_w as usize > strip_w {
                 return true; // 越界视为有遮挡
             }
-            if edge_region_has_content(&edge, strip_w, strip_h, ox, max_w as usize, wy0, rh) {
+            // 前台标题栏条带内豁免内容判定（同 phase1）
+            if !in_caption_strip_of_window_at(x, ctx.y, max_w, ctx.h)
+                && edge_region_has_content(&edge, strip_w, strip_h, ox, max_w as usize, wy0, rh)
+            {
                 return true;
             }
             let mut sx = x + max_w - 8;
@@ -1903,29 +2274,50 @@ impl App {
         // 回归右缘模式：当前未遮挡，只在完全空位中挑最靠右的（x 最大）；
         // 已在最右（无更靠右空位）则原地不动
         if ctx.ret_right {
-            // 目标 y：标题栏按钮带中心（顶部 48px），与 x 一步到位
-            let ty = strip_button_band_center_y(&edge, strip_w, strip_h)
-                .map(|c| ctx.wa.top + c - ctx.h / 2)
-                .map(|y| y.max(ctx.wa.top));
+            // 目标 y：标题栏按钮带中心（UIA 优先，截图启发式回退），与 x 一步到位
+            let ty = self.align_anchor_top(&edge, strip_w, strip_h, ctx.wa.top, ctx.h);
+            // 最靠右 x：直接贴前台窗口标题栏按钮区左侧（不压按钮），
+            // 不再依赖"空位搜索 + 100px 阈值 + 冷却"——最大化窗口的标题栏
+            // 文字会让空位搜索处处误判占用，x 就永远停在旧位置。
+            // 覆盖标题文字是贴右缘的预期行为；按钮安全由目标公式保证
             let mut dest: Option<POINT> = None;
-            let cd_ok = self.ret_cooldown_until.is_none_or(|t| t <= Instant::now());
-            let best = evaluated
-                .iter()
-                .filter(|(_, occupied, _)| !occupied)
-                .map(|&(nx, _, _)| nx)
-                .max();
-            if let Some(nx) = best {
-                // 明显更靠右才动（≥100px），且冷却期外；y 对齐不受冷却限制
-                if nx > ctx.left0 + 100 && cd_ok {
-                    dest = Some(POINT { x: nx, y: ty.unwrap_or(ctx.y) });
-                }
-            }
-            if dest.is_none() {
-                // x 已在最右：只修 y 偏差（≥2px 即修：浏览器标题栏高度差
-                // 往往只有两三像素，死区大了用户肉眼可见不对齐）
-                if let Some(y) = ty {
+            let cluster_left = {
+                let cy = uia_cached_close_y(self.last_fg_hwnd)
+                    .map(|y| (y - ctx.wa.top).max(16) as usize)
+                    .or_else(|| strip_button_band_center_y(&edge, strip_w, strip_h).map(|c| c.max(16) as usize))
+                    .unwrap_or(24);
+                strip_button_cluster_left(&edge, strip_w, strip_h, cy, ctx.wa.left)
+            };
+            let snap_x = self.auto_x_target(cluster_left);
+            if let Some(ax) = snap_x {
+                if ax != ctx.left0 {
+                    dest = Some(POINT { x: ax, y: ty.unwrap_or(ctx.y) });
+                } else if let Some(y) = ty {
                     if (y - ctx.y).abs() >= 2 {
                         dest = Some(POINT { x: ctx.left0, y });
+                    }
+                }
+            }
+            let cd_ok = self.ret_cooldown_until.is_none_or(|t| t <= Instant::now());
+            if dest.is_none() {
+                let best = evaluated
+                    .iter()
+                    .filter(|(_, occupied, _)| !occupied)
+                    .map(|&(nx, _, _)| nx)
+                    .max();
+                if let Some(nx) = best {
+                    // 明显更靠右才动（≥100px），且冷却期外；y 对齐不受冷却限制
+                    if nx > ctx.left0 + 100 && cd_ok {
+                        dest = Some(POINT { x: nx, y: ty.unwrap_or(ctx.y) });
+                    }
+                }
+                if dest.is_none() {
+                    // x 已在最右：只修 y 偏差（≥2px 即修：浏览器标题栏高度差
+                    // 往往只有两三像素，死区大了用户肉眼可见不对齐）
+                    if let Some(y) = ty {
+                        if (y - ctx.y).abs() >= 2 {
+                            dest = Some(POINT { x: ctx.left0, y });
+                        }
                     }
                 }
             }
@@ -1942,12 +2334,35 @@ impl App {
             return;
         }
 
+        // 自动模式：避让选位优先评估"贴右缘目标位"（与回归右缘一致）。
+        // 否则避让会先把胶囊扔到任意空位、随后贴右 snap 再修一次——
+        // 这就是切换程序时"跳好几次才到位"的来源
+        // 先算 y（顺路完成 UIA×像素交叉校验，distrust 落定后 x 才用对预留）
+        let ny_pre = self.align_anchor_top(&edge, strip_w, strip_h, ctx.wa.top, ctx.h);
+        // 按钮簇左缘（边缘图扫描）：UIA 过期矩形弃用时的真实边界
+        let cluster_left = {
+            let cy = uia_cached_close_y(self.last_fg_hwnd)
+                .map(|y| (y - ctx.wa.top).max(16) as usize)
+                .or_else(|| strip_button_band_center_y(&edge, strip_w, strip_h).map(|c| c.max(16) as usize))
+                .unwrap_or(24);
+            strip_button_cluster_left(&edge, strip_w, strip_h, cy, ctx.wa.left)
+        };
+        let mut target = if !self.user_pinned {
+            self.auto_x_target(cluster_left).filter(|&ax| {
+                let ox = (ax - ctx.wa.left) as usize;
+                ox + max_w as usize <= strip_w && !occ(ax)
+            })
+        } else {
+            None
+        };
         // 靠右原则：有空位就取**最靠右**的完全空位（不再就近）
-        let mut target = evaluated
-            .iter()
-            .filter(|(_, occupied, _)| !occupied)
-            .map(|&(nx, _, _)| nx)
-            .max();
+        if target.is_none() {
+            target = evaluated
+                .iter()
+                .filter(|(_, occupied, _)| !occupied)
+                .map(|&(nx, _, _)| nx)
+                .max();
+        }
         if target.is_some() {
             self.fb_x = 0;
         }
@@ -2004,15 +2419,17 @@ impl App {
 
         // 确定目标位置后，淡出→挪过去→淡入
         if let Some(nx) = target {
+            let ny = ny_pre.unwrap_or(ctx.y);
+            // 目标与当前位置相同：什么都不用做。带动画"挪"到原地 = 无限闪烁
+            if nx == ctx.x0 && (ny - ctx.y).abs() < 2 {
+                return;
+            }
             // 兜底移动（无空位时）计入连击，冷却拉长到 30 秒打破循环
             let fallback = evaluated.iter().all(|(_, o, _)| *o);
             self.fb_runs = if fallback { self.fb_runs + 1 } else { 0 };
             self.fade_x = nx;
-            // 一步到位：x 与标题栏对齐 y 同时移动，不再分两段
-            self.fade_y = strip_button_band_center_y(&edge, strip_w, strip_h)
-                .map(|c| ctx.wa.top + c - ctx.h / 2)
-                .map(|y| y.max(ctx.wa.top))
-                .unwrap_or(ctx.y);
+            // 一步到位：x 与标题栏对齐 y 同时移动，不再分两段（UIA 优先）
+            self.fade_y = ny;
             self.dodging = true;
             self.fade_phase = 1;
             // 避让后 30s 内不做回归右缘检查——先稳定驻留，防乒乓
@@ -2025,6 +2442,62 @@ impl App {
         }
     }
 
+    /// y 对齐锚点（屏幕坐标下温度计窗口的目标 top）：
+    /// 优先 UIA 缓存的关闭按钮真实 y 中心，查不到回退截图启发式条带中心
+    fn align_anchor_top(&mut self, edge: &[u8], w: usize, h: usize, wa_top: i32, wh: i32) -> Option<i32> {
+        // 只跟随宽窗口：前台是弹窗/小窗（浏览器下载条、提示框等瞬态前台）
+        // 时锚点几何很怪（可能贴近屏幕底部），跟随会造成来回弹跳；
+        // 保持原位等 burst 下一轮（届时前台已回到正常窗口）
+        if !self.fg_is_wide() {
+            return None;
+        }
+        let strip = strip_button_band_center_y(edge, w, h).map(|c| wa_top + c);
+        let uia = uia_cached_close_y(self.last_fg_hwnd);
+        let y = match (uia, strip) {
+            (Some(u), Some(sp)) if (u - sp).abs() > 6 => {
+                // UIA 与像素矛盾：Chromium 系窗口的 UIA 矩形会过期
+                // （布局变了树还报旧值），该窗口 TTL 内弃用 UIA
+                self.uia_distrust = Some((self.last_fg_hwnd, Instant::now()));
+                if self.debug_on() {
+                    eprintln!("[uia-distrust] hwnd={:#x} uia={u} strip={sp}", self.last_fg_hwnd);
+                }
+                sp
+            }
+            (Some(u), _) => u,
+            (None, Some(sp)) => sp,
+            (None, None) => return None,
+        };
+        Some((y - wh / 2).max(wa_top))
+    }
+
+    /// 当前前台窗口的 UIA 是否已被交叉校验否决（TTL 60s）
+    fn uia_distrusted(&self) -> bool {
+        self.uia_distrust
+            .is_some_and(|(h, t)| h == self.last_fg_hwnd && t.elapsed() < std::time::Duration::from_secs(60))
+    }
+
+    /// 前台窗口宽度是否 ≥60% 屏宽
+    fn fg_is_wide(&self) -> bool {
+        unsafe {
+            let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+            if fg.is_invalid() {
+                return false;
+            }
+            let mut fr = RECT::default();
+            if GetWindowRect(fg, &mut fr).is_err() {
+                return false;
+            }
+            let mut wa = RECT::default();
+            let _ = SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                Some(&mut wa as *mut RECT as _),
+                windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            );
+            fr.right - fr.left >= (wa.right - wa.left) * 3 / 5
+        }
+    }
+
     /// 从右缘条带（200×48）的边缘图判定标题栏按钮行的垂直中心并同步。
     /// 按钮行表现为一条水平密集带；取带中心，把温度计垂直居中对齐过去。
     /// 只在明显偏移（>3px）时移动；移动后 10s 内不重复同步
@@ -2034,13 +2507,23 @@ impl App {
         }
         let w = req.w as usize;
         let h = req.h as usize;
-        let Some(cy) = strip_button_band_center_y(edge, w, h) else {
+        let strip_cy = strip_button_band_center_y(edge, w, h);
+        let h_w0 = unsafe {
+            let mut r0 = RECT::default();
+            if GetWindowRect(self.hwnd, &mut r0).is_ok() { r0.bottom - r0.top } else { 24 }
+        };
+        let center = self
+            .align_anchor_top(edge, w, h, req.y, h_w0)
+            .map(|ty| ty + h_w0 / 2);
+        let Some(center) = center else {
             if self.debug_on() {
                 eprintln!("[title-sync] strip has no content rows");
             }
             return;
         };
-        let center = req.y + cy;
+        if self.debug_on() {
+            eprintln!("[title-sync] anchor={}", if self.uia_distrusted() { "strip(交叉校验否决uia)" } else if uia_cached_close_y(self.last_fg_hwnd).is_some() { "uia" } else { "strip" });
+        }
         unsafe {
             let mut r = RECT::default();
             if GetWindowRect(self.hwnd, &mut r).is_err() {
@@ -2186,6 +2669,7 @@ impl App {
             bg_mode: self.bg_mode,
             dodge_secs: self.dodge_secs,
             pinned: self.user_pinned,
+            widest: self.widest,
         }
     }
 
@@ -2222,8 +2706,35 @@ unsafe fn set_no_shadow(hwnd: HWND) {
     );
 }
 
-/// 采样点是否落在某个窗口右上角的标题栏按钮区（最小化/最大化/关闭）。
-/// 最小化按钮只有一条 1px 细线，边缘密度注定低于内容阈值，
+/// 该区域是否落在宽窗口的标题栏条带内（按胶囊所在位置的窗口判定，
+/// 而非前台——前台切到窄窗口（控制台等）时浏览器标题文字仍是标题文字，
+/// 不该重新变成"被压住的内容"，否则会对着原地反复播放避让动画=闪烁）。
+/// 贴右缘跟随必然覆盖标题文字——那是预期行为，遮挡判定应豁免；
+/// 按钮区由 caption_zone_hit 单独保护。
+unsafe fn in_caption_strip_of_window_at(x: i32, y: i32, w: i32, h: i32) -> bool {
+    let win = WindowFromPoint(POINT { x: x + w / 2, y: y + h / 2 });
+    if win.is_invalid() {
+        return false;
+    }
+    let mut fr = RECT::default();
+    if GetWindowRect(win, &mut fr).is_err() {
+        return false;
+    }
+    let mut wa = RECT::default();
+    let _ = SystemParametersInfoW(
+        SPI_GETWORKAREA,
+        0,
+        Some(&mut wa as *mut RECT as _),
+        windows::Win32::UI::WindowsAndMessaging::SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+    );
+    // 窗口太窄（<60% 屏宽）时标题栏条带不延伸到胶囊所在的天头区域
+    if fr.right - fr.left < (wa.right - wa.left) * 3 / 5 {
+        return false;
+    }
+    y >= fr.top && y + h <= fr.top + 60 && x + w > fr.left && x < fr.right
+}
+
+/// 采样点是否落在某个窗口右上角的标题栏按钮区（最小化/最大化/关闭）。/// 最小化按钮只有一条 1px 细线，边缘密度注定低于内容阈值，
 /// 但所有 Win11 应用的窗口控制按钮都固定在窗口右上角，用窗口枚举识别。
 /// 自身是 WS_EX_TRANSPARENT 穿透窗口，WindowFromPoint 会跳过它。
 unsafe fn caption_zone_hit(x: i32, y: i32) -> bool {
@@ -2245,8 +2756,14 @@ unsafe fn caption_zone_hit(x: i32, y: i32) -> bool {
     if GetWindowRect(hwnd, &mut r).is_err() {
         return false;
     }
-    // 右上角 160×45px 区域：Win11 最小化/最大化/关闭三按钮的位置
-    x > r.right - 160 && x <= r.right && y >= r.top && y < r.top + 45
+    // 按钮区左缘：优先用 UIA 枚举的真实按钮簇边界（ZCode 等应用标题栏
+    // 除标准三枚外还有附加按钮，通用 160px 会把贴右位置误判为压按钮，
+    // 触发"避让挪走 → snap 贴回"的来回拉扯）；UIA 未就绪退回 160px 估算
+    let zone = match uia_anchor_state(hwnd.0 as isize) {
+        AnchorState::Ready(_, zl) => zl - CAPTION_GAP,
+        _ => r.right - CAPTION_FALLBACK,
+    };
+    x >= zone && x <= r.right && y >= r.top && y < r.top + 60
 }
 
 /// 对截屏像素计算内容图（整条只算一次，供所有候选位置复用）：
@@ -2372,6 +2889,53 @@ fn strip_button_band_center_y(edge: &[u8], w: usize, h: usize) -> Option<i32> {
         }
     }
     None
+}
+
+/// 从边缘图扫标题栏按钮簇的左缘（屏幕 x）：按钮行带内自右缘向左找
+/// 连续字形列，允许 ≤24px 的按钮间距，遇到更大空隙（标签页文字/工具栏
+/// 的空白）即停。UIA 矩形过期（Chromium 滞后）时用它定位真实按钮簇——
+/// 固定 190px 预留盖不住扩展按钮（"5"/下载/T恤图标），会贴成 1px 缝。
+fn strip_button_cluster_left(
+    edge: &[u8],
+    w: usize,
+    h: usize,
+    cy: usize,
+    strip_left: i32,
+) -> Option<i32> {
+    if w < 60 || h < 8 {
+        return None;
+    }
+    let y0 = cy.saturating_sub(16);
+    let y1 = (cy + 16).min(h - 1);
+    let col_on = |x: usize| -> bool {
+        (y0..=y1).any(|y| edge[y * w + x] != 0)
+    };
+    // 起点：右缘 60px 内第一个有字形的列（按钮贴窗口右缘；找不到则不判）
+    let mut x = w - 2;
+    let mut start = None;
+    while x > w - 60 {
+        if col_on(x) {
+            start = Some(x);
+            break;
+        }
+        x -= 1;
+    }
+    let mut x = start?;
+    let mut left = x;
+    let mut gap = 0usize;
+    while x > 0 {
+        x -= 1;
+        if col_on(x) {
+            left = x;
+            gap = 0;
+        } else {
+            gap += 1;
+            if gap > 24 {
+                break;
+            }
+        }
+    }
+    Some(strip_left + left as i32)
 }
 
 fn edge_region_stats(
@@ -2804,6 +3368,10 @@ unsafe extern "system" fn wndproc(
                     MENU_RESET_POS => {
                         (*ptr).pos = None;
                         (*ptr).user_pinned = false;
+                        save_config(&(*ptr).as_config());
+                    }
+                    MENU_PIN => {
+                        (*ptr).user_pinned = !(*ptr).user_pinned;
                         save_config(&(*ptr).as_config());
                     }
                     id if (MENU_CAPSULE_BASE..MENU_CAPSULE_BASE + 9).contains(&id) => {

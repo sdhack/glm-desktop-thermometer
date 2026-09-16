@@ -1,6 +1,10 @@
-# UIA 标题栏按钮对齐——实现方案（待实施）
+# UIA 标题栏按钮对齐——实现方案（已实施）
 
-> 状态：未开工。本文档供新会话接手，避免重复排查。
+> 状态：已实现并验证（2026-09-16）。实现在 `crates/tempmon-ui/src/main.rs`
+> `uia_ensure_request` / `uia_query_close_y` / `uia_cached_close_y` /
+> `App::align_anchor_top`，截图启发式 `strip_button_band_center_y` 保留为回退。
+> 新增坑：浏览器标签页的关闭按钮同名"关闭"，名字命中后必须做右上角区域校验；
+> 微信内置浏览器窗口常以隐藏态存在（ShowWindow 后可测）。
 
 ## 背景
 

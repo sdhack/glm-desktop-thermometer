@@ -18,7 +18,10 @@ def cb(hwnd, lp):
         size = wintypes.DWORD(512)
         if k.QueryFullProcessImageNameW(h, 0, b, ctypes.byref(size)):
             if b.value.split(chr(92))[-1] == 'tempmon.exe':
-                found = hwnd
+                r0 = wintypes.RECT()
+                u.GetWindowRect(hwnd, ctypes.byref(r0))
+                if r0.right - r0.left > 10:  # 跳过 0 大小辅助窗口
+                    found = hwnd
         k.CloseHandle(h)
     return True
 
