@@ -565,8 +565,9 @@ struct App {
 
 // ── 配置持久化 ──
 
+// 程序目录（便携）优先，不可写时库内自动回退 %APPDATA%
 fn config_path() -> Option<PathBuf> {
-    std::env::var("APPDATA").ok().map(|d| PathBuf::from(d).join("tempmon.conf"))
+    tempmon_sensor::config_path()
 }
 
 fn load_config() -> Config {
@@ -583,8 +584,8 @@ fn load_config() -> Config {
         pinned: false,
         widest: 0,
     };
-    if let Some(p) = config_path() {
-        if let Ok(text) = std::fs::read_to_string(p) {
+    if let Some(text) = tempmon_sensor::read_config_text() {
+        {
             for line in text.lines() {
                 let (k, v) = match line.split_once('=') {
                     Some(kv) => kv,

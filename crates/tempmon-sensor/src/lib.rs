@@ -582,16 +582,7 @@ pub fn sensor_loop() {
                 }
             }
             // 刷新间隔跟配置走（UI 菜单可调，写回 tempmon.conf 的 refresh= 行）
-            let ms = std::fs::read_to_string(config_refresh_ms())
-                .ok()
-                .and_then(|t| {
-                    t.lines().find_map(|l| {
-                        l.strip_prefix("refresh=")
-                            .and_then(|v| v.trim().parse::<u32>().ok())
-                    })
-                })
-                .filter(|v| (250..=5000).contains(v))
-                .unwrap_or(1000);
+            let ms = config_refresh_ms();
             Sleep(ms);
         }
     }
@@ -766,8 +757,53 @@ fn query_disk_temps_native() -> Option<Vec<f32>> {
 }
 
 
-/// 配置文件路径（与 UI 侧 %APPDATA%	empmon.conf 一致）
-fn config_refresh_ms() -> std::path::PathBuf {
-    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-    std::path::PathBuf::from(base).join("tempmon.conf")
+/// 配置文件路径：默认在程序目录（便携），exe 目录不可写（如 Program Files）
+/// 时回退 %APPDATA%。UI 与采集子进程共用，保证读写同一份。
+pub fn config_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let portable = exe.parent()?.join("tempmon.conf");
+    if portable.exists() {
+        return Some(portable);
+    }
+    // 用"能否创建文件"探测目录可写性；创建成功留下的空文件无害
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&portable)
+        .is_ok()
+    {
+        return Some(portable);
+    }
+    if portable.exists() {
+        return Some(portable); // 与另一进程并发创建的兜底
+    }
+    let base = std::env::var("APPDATA").ok()?;
+    Some(std::path::PathBuf::from(base).join("tempmon.conf"))
+}
+
+/// 兼容迁移：v1.3.1 及之前配置固定在 %APPDATA%，读旧值用（只读，不写回）
+pub fn legacy_config_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var("APPDATA").ok()?;
+    Some(std::path::PathBuf::from(base).join("tempmon.conf"))
+}
+
+/// 读配置全文：程序目录优先；空文件/不存在时回退旧 %APPDATA% 配置（迁移）。
+/// 可写性探测留下的空文件不能当作"已有配置"，否则会遮蔽旧配置。
+pub fn read_config_text() -> Option<String> {
+    let fresh = config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .filter(|t| !t.trim().is_empty());
+    fresh.or_else(|| legacy_config_path().and_then(|p| std::fs::read_to_string(p).ok()))
+}
+
+fn config_refresh_ms() -> u32 {
+    read_config_text()
+        .and_then(|t| {
+            t.lines().find_map(|l| {
+                l.strip_prefix("refresh=")
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+            })
+        })
+        .filter(|v| (250..=5000).contains(v))
+        .unwrap_or(1000)
 }
