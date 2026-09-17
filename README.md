@@ -188,7 +188,10 @@ cp bin/Release/net8.0/win-x64/publish/* ../../target/release/
   普通模式走 `SetWindowRgn` 区域裁剪（天然无投影），Win10 自动回退
 - **看门狗时间基 + 退避**：帧停滞按真实时间判定（8 秒），连续失败指数退避（最长 96 秒）——
   环境性故障不会引发进程重生风暴
-- **周期性工作集修剪**：三进程每 10 分钟 `SetProcessWorkingSetSize` 换出冷页，
+- **周期性工作集修剪**：三进程每 10 分钟 `SetProcessWorkingSetSize` 换出冷页
+- **驱动装载自愈**：驱动服务按需创建、路径漂移自动改回、启动失败带全错误
+  码写入能力日志并逐秒重试，成功后转开机自启——温度段"静默消失"这类故障
+  从机制上杜绝
 
 ## ⚙️ 全部可配置
 
@@ -222,6 +225,29 @@ cp bin/Release/net8.0/win-x64/publish/* ../../target/release/
 ## 📋 更新日志
 
 <details open>
+<summary><b>v1.3.2 · 驱动装载自愈（CPU 温度消失根治）</b></summary>
+
+**修复**
+- 🩹 **CPU 温度不显示的真正根因**：打开驱动服务时缺 `SERVICE_START` 权限位，
+  `StartServiceW` 永远报"拒绝访问"却被静默吞掉——旧版只能靠管理员手动
+  `sc start` 绕过。现在服务句柄带全所需权限，应用自己就能启动驱动
+- 🩹 **服务路径漂移自愈**：驱动服务二进制路径指向旧位置（目录移动/重装）时，
+  自动改回当前 exe 旁的 `lhm-bridge.sys`，不再卡死在坏路径上
+- 🩹 **启动竞态**：`StartService` 后轮询等服务真正进入 RUNNING（最多 3s）
+  再开设备，消除"服务刚拉起设备还没就绪"的偶发失败
+
+**新增**
+- ✅ **驱动开机自启**：首次启动成功后把服务改为 `AUTO_START`，重启电脑后
+  驱动随系统加载，应用免管理员权限直开设备
+- ✅ **构建期驱动部署**：`lhm-bridge.sys` 收编进版本库，`build.rs` 每次编译
+  自动复制到 exe 目录——新 clone / 新机器不会再缺文件
+- ✅ **可观测性**：驱动装载链路每一步的失败原因（权限 / 缺文件 / 路径漂移 /
+  启动超时）写入 `%APPDATA%\tempmon-caps.log` 的 `driver=` 字段，温度再消失
+  一眼定位
+
+</details>
+
+<details>
 <summary><b>v1.3.1 · 避让乒乓与菜单勾选修复</b></summary>
 
 **修复**
@@ -304,8 +330,14 @@ cp bin/Release/net8.0/win-x64/publish/* ../../target/release/
 <details>
 <summary><b>CPU 温度显示不了？</b></summary>
 
-CPU 温度来自 LibreHardwareMonitor 内核驱动，部分杀软（360 等）可能拦截。
-若温度段消失，检查 lhm-bridge.sys 是否被拦截并添加信任（CPU 温度/风扇需要管理员权限装载驱动）。
+CPU 温度来自 LibreHardwareMonitor 内核驱动（`lhm-bridge.sys`），程序会全自动
+完成"找驱动 → 建服务 → 启动 → 修路径 → 开机自启"整条装载链路，正常情况
+无需任何手动干预。部分杀软（360 等）可能拦截驱动装载，若温度段消失：
+
+1. 看 `%APPDATA%\tempmon-caps.log` 末行的 `driver=` 字段，失败原因一目了然
+   （如 `驱动文件缺失`、`StartService 失败`、`ok`）
+2. 若是杀软拦截，将 `lhm-bridge.sys` 添加信任后重启温度计即可——装载失败
+   会在每秒采样中自动重试，无需重启电脑
 </details>
 
 <details>
@@ -337,7 +369,8 @@ GPU 空闲时 Windows 会注销 PDH 计数器实例。已内置 15 秒防抖沿�
 ├─ crates/
 │  ├─ tempmon-ui/       # UI：窗口/渲染/策略/菜单/钩子/看门狗
 │  └─ tempmon-sensor/   # 采集：PDH/DXGI/NVML/共享内存协议
-├─ ring0.rs             # CPU 温度+风扇（WinRing0 进程内直读：Intel MSR / AMD SMN；Nuvoton/ITE 风扇）
+│     ├─ src/ring0.rs   # CPU 温度+风扇（WinRing0 进程内直读：Intel MSR / AMD SMN；Nuvoton/ITE 风扇；驱动装载自愈）
+│     └─ driver/        # lhm-bridge.sys（build.rs 构建期自动复制到 exe 目录）
 ├─ tools/               # 诊断脚本（避让检测 / 盘温验证）
 ├─ 方案.md              # 技术方案（架构/选型/风险/里程碑）
 └─ 开发记录.md          # 开发日志 + 踩坑记录
