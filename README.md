@@ -220,7 +220,8 @@ cp bin/Release/net8.0/win-x64/publish/* ../../target/release/
 
 </details>
 
-配置文件 `%APPDATA%\tempmon.conf`，即改即存、重启恢复。
+配置文件 `tempmon.conf` 默认在**程序目录**（便携；目录不可写时自动回退
+`%APPDATA%\tempmon.conf`，旧配置自动迁移），即改即存、重启恢复。
 
 ## 📋 更新日志
 
@@ -237,6 +238,9 @@ cp bin/Release/net8.0/win-x64/publish/* ../../target/release/
   再开设备，消除"服务刚拉起设备还没就绪"的偶发失败
 
 **新增**
+- ✅ **配置文件便携化**：`tempmon.conf` 默认写在**程序目录**——整个目录拷走
+  配置跟着走；程序目录不可写（如 Program Files）自动回退 `%APPDATA%`，
+  旧版 APPDATA 配置首次启动自动迁移。UI 与采集子进程共用同一份
 - ✅ **驱动开机自启**：首次启动成功后把服务改为 `AUTO_START`，重启电脑后
   驱动随系统加载，应用免管理员权限直开设备
 - ✅ **构建期驱动部署**：`lhm-bridge.sys` 收编进版本库，`build.rs` 每次编译
