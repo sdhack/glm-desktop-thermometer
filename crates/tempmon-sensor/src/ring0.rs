@@ -9,16 +9,19 @@
 
 use std::sync::Mutex;
 
-use windows::core::HSTRING;
+use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Services::{
-    CloseServiceHandle, CreateServiceW, OpenSCManagerW, OpenServiceW, StartServiceW, SC_HANDLE,
-    SC_MANAGER_ALL_ACCESS, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, SERVICE_KERNEL_DRIVER,
-    SERVICE_QUERY_CONFIG,
+    ChangeServiceConfigW, CloseServiceHandle, CreateServiceW, OpenSCManagerW, OpenServiceW,
+    QueryServiceConfigW, QueryServiceStatus, StartServiceW, SC_HANDLE, SC_MANAGER_ALL_ACCESS,
+    SERVICE_CHANGE_CONFIG, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, SERVICE_KERNEL_DRIVER,
+    SERVICE_NO_CHANGE, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS,
+    SERVICE_STOPPED, ENUM_SERVICE_TYPE, QUERY_SERVICE_CONFIGW, SERVICE_AUTO_START, SERVICE_ERROR,
+    SERVICE_START, SERVICE_START_TYPE,
 };
 
 const DEVICE_PATH: &str = "\\\\.\\WinRing0_1_2_0";
@@ -30,23 +33,41 @@ const IOCTL_WRITE_IO_PORT_BYTE: u32 = (40000 << 16) | (2 << 14) | (0x836 << 2); 
 
 static DRIVER: Mutex<Option<usize>> = Mutex::new(None); // HANDLE(usize)，仅传感器线程使用
 
-/// 拿到驱动句柄；首次调用时确保服务已装载。失败返回 None。
+/// 驱动装载诊断：最近一次失败的原因（写入能力日志，供"温度为什么没了"排查）。
+static DIAG: Mutex<Option<String>> = Mutex::new(None);
+
+fn diag(msg: String) {
+    if let Ok(mut d) = DIAG.lock() {
+        *d = Some(msg);
+    }
+}
+
+fn diag_take() -> Option<String> {
+    DIAG.lock().ok().and_then(|mut d| d.take())
+}
+
+/// 拿到驱动句柄；首次调用时确保服务已装载。失败返回 None（原因记入 DIAG）。
 fn driver() -> Option<HANDLE> {
     if let Ok(guard) = DRIVER.lock() {
         if let Some(h) = *guard {
             return Some(HANDLE(h as _));
         }
     }
-    let h = open_device().or_else(ensure_service_then_open)?;
+    let Some(h) = open_device().or_else(ensure_service_then_open) else {
+        return None;
+    };
     if let Ok(mut guard) = DRIVER.lock() {
         *guard = Some(h.0 as usize);
+    }
+    if let Ok(mut d) = DIAG.lock() {
+        *d = None;
     }
     Some(h)
 }
 
 fn open_device() -> Option<HANDLE> {
     unsafe {
-        CreateFileW(
+        match CreateFileW(
             &HSTRING::from(DEVICE_PATH),
             0xC000_0000u32, // GENERIC_READ | GENERIC_WRITE
             FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -54,50 +75,164 @@ fn open_device() -> Option<HANDLE> {
             OPEN_EXISTING,
             FILE_FLAGS_AND_ATTRIBUTES(0),
             None,
-        )
-        .ok()
-        .map(|f| HANDLE(f.0))
+        ) {
+            Ok(f) => Some(HANDLE(f.0)),
+            Err(e) => {
+                diag(format!("open device 失败: {e}"));
+                None
+            }
+        }
     }
 }
 
 /// 设备未就绪时：以 LHM 同款命名（R0<进程名>）建内核驱动服务并启动，再开设备。
 /// 用 SCManager API 而非 sc.exe：不受路径引号/编码影响。
+/// 自愈三件事：服务不存在则建；存在但二进制路径漂移则改回；启动后轮询等 RUNNING。
 fn ensure_service_then_open() -> Option<HANDLE> {
-    let sys = std::env::current_exe().ok()?.parent()?.join("lhm-bridge.sys");
+    let exe = std::env::current_exe().ok()?;
+    let sys = exe.parent()?.join("lhm-bridge.sys");
     if !sys.exists() {
+        diag(format!("驱动文件缺失: {}", sys.display()));
         return None;
     }
-    let exe = std::env::current_exe().ok()?;
     let name = HSTRING::from(format!("R0{}", exe.file_stem()?.to_string_lossy()));
     let path = HSTRING::from(sys.as_os_str());
     unsafe {
-        let scm = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS).ok()?;
-        let _scm_guard = ScmGuard(scm);
-        // 已存在则直接复用；OpenService 失败（服务不存在）才创建
-        let svc: SC_HANDLE = match OpenServiceW(scm, &name, SERVICE_QUERY_CONFIG) {
+        let scm = match OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS) {
             Ok(s) => s,
-            Err(_) => CreateServiceW(
-                scm,
-                &name,
-                &name,
-                0,
-                SERVICE_KERNEL_DRIVER,
-                SERVICE_DEMAND_START,
-                SERVICE_ERROR_NORMAL,
-                &path,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .ok()?,
+            Err(e) => {
+                diag(format!("OpenSCManager 失败（需要管理员）: {e}"));
+                return None;
+            }
+        };
+        let _scm_guard = ScmGuard(scm);
+        // 已存在则复用（顺带校验路径）；不存在才创建
+        let svc: SC_HANDLE = match OpenServiceW(
+            scm,
+            &name,
+            SERVICE_START | SERVICE_QUERY_CONFIG | SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS,
+        ) {
+            Ok(s) => {
+                fix_service_path_if_drifted(s, &path);
+                s
+            }
+            Err(_) => {
+                match CreateServiceW(
+                    scm,
+                    &name,
+                    &name,
+                    0,
+                    SERVICE_KERNEL_DRIVER,
+                    SERVICE_DEMAND_START,
+                    SERVICE_ERROR_NORMAL,
+                    &path,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        diag(format!("CreateService 失败: {e}"));
+                        return None;
+                    }
+                }
+            }
         };
         let _svc_guard = ScmGuard(svc);
-        // 已在运行时 StartService 会失败，不碍事：设备能打开就行
-        let _ = StartServiceW(svc, None);
+        match StartServiceW(svc, None) {
+            Ok(()) => {
+                // 启动成功后顺手改为开机自启：重启后驱动随系统加载，
+                // 应用免管理员权限也能直开设备（失败不碍事，仅记录）
+                if let Err(e) = ChangeServiceConfigW(
+                    svc,
+                    ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+                    SERVICE_AUTO_START,
+                    SERVICE_ERROR(SERVICE_NO_CHANGE),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ) {
+                    diag(format!("设为开机自启失败（不影响本次）: {e}"));
+                }
+            }
+            // 已在运行：正常复用
+            Err(e) if e.code() == windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING.to_hresult() => {}
+            Err(e) => {
+                diag(format!("StartService 失败: {e}"));
+                return None;
+            }
+        }
+        // 驱动启动是异步的：轮询等 RUNNING（最多 ~3s），立刻开设备可能拿到 not ready
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let mut st = SERVICE_STATUS::default();
+            if QueryServiceStatus(svc, &mut st).is_ok()
+                && (st.dwCurrentState == SERVICE_RUNNING || st.dwCurrentState == SERVICE_STOPPED)
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                diag("驱动服务 3s 内未进入 RUNNING".into());
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
-    open_device()
+    let h = open_device();
+    if h.is_some() {
+        diag_take(); // 成功：清掉历史失败记录
+    }
+    h
+}
+
+/// 服务存在但二进制路径不对（旧目录被移动/重装到新位置）时改回当前路径。
+/// 路径一致则零开销，一次 QueryServiceConfig。
+unsafe fn fix_service_path_if_drifted(svc: SC_HANDLE, path: &HSTRING) {
+    let mut need = 0u32;
+    let _ = QueryServiceConfigW(svc, None, 0, &mut need);
+    if need == 0 {
+        return;
+    }
+    let mut buf = vec![0u8; need as usize];
+    let mut got = 0u32;
+    if QueryServiceConfigW(svc, Some(buf.as_mut_ptr() as _), need, &mut got).is_err() {
+        return;
+    }
+    let cfg = &*(buf.as_ptr() as *const QUERY_SERVICE_CONFIGW);
+    let current = PCWSTR(cfg.lpBinaryPathName.0)
+        .to_string()
+        .unwrap_or_default();
+    let want = path.to_string();
+    // 服务路径带 \??\ 前缀（内核对象命名空间），比对时归一
+    fn norm(s: &str) -> &str {
+        s.trim_start_matches("\\??\\").trim_end_matches('\0')
+    }
+    if norm(&current).eq_ignore_ascii_case(norm(&want)) {
+        return;
+    }
+    if let Err(e) = ChangeServiceConfigW(
+        svc,
+        ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+        SERVICE_START_TYPE(SERVICE_NO_CHANGE),
+        SERVICE_ERROR(SERVICE_NO_CHANGE),
+        path,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ) {
+        diag(format!("服务路径漂移且修复失败 ({current}): {e}"));
+    } else {
+        diag(format!("检测到服务路径漂移，已修复 → {}", norm(&want)));
+    }
 }
 
 struct ScmGuard(SC_HANDLE);
@@ -496,12 +631,13 @@ struct CapLog {
 impl CapLog {
     fn flush(&self) {
         let line = format!(
-            "{} | cpu_vendor={:?} | cpu_temp={} | superio={} | fans=[{}]\n",
+            "{} | cpu_vendor={:?} | cpu_temp={} | superio={} | fans=[{}] | driver={}\n",
             chrono_like_now(),
             cpu_vendor(),
             self.cpu.as_deref().unwrap_or("无"),
             self.superio,
             self.fans,
+            diag_take().as_deref().unwrap_or("ok"),
         );
         if let Ok(mut p) = std::env::var("APPDATA") {
             p.push_str("\\tempmon-caps.log");
