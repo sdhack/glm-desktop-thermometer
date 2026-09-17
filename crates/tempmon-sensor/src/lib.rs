@@ -34,7 +34,7 @@ pub struct Snapshot {
     pub fans: Vec<f32>,       // 最多三个风扇转速
 }
 
-pub struct SensorHub {
+struct SensorHub {
     cpu: Option<(PDH_HQUERY, PDH_HCOUNTER)>,
     gpu_util: Option<(PDH_HQUERY, PDH_HCOUNTER)>,
     gpu_vram: Option<(PDH_HQUERY, PDH_HCOUNTER)>,
@@ -56,7 +56,7 @@ impl Drop for SensorHub {
 
 impl SensorHub {
     /// 打不开的采集通道自动跳过（对应字段保持 None，UI 隐藏），绝不 panic。
-    pub fn new() -> Self {
+    fn new() -> Self {
         let cpu = open_query(w!("\\Processor(_Total)\\% Processor Time"));
         let gpu_util = open_query(w!("\\GPU Engine(*engtype_3D)\\Utilization Percentage"));
         let gpu_vram = open_query(w!("\\GPU Adapter Memory(*)\\Dedicated Usage"));
@@ -83,7 +83,7 @@ impl SensorHub {
         hub
     }
 
-    pub fn sample(&mut self) -> Snapshot {
+    fn sample(&mut self) -> Snapshot {
         let mut s = Snapshot::default();
 
         unsafe {
