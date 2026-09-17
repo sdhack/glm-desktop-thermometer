@@ -226,6 +226,25 @@ cp bin/Release/net8.0/win-x64/publish/* ../../target/release/
 ## 📋 更新日志
 
 <details open>
+<summary><b>v1.3.3 · 仓库瘦身（ponytail 式重构）</b></summary>
+
+**清理**
+- 🧹 **删除废弃的 `tools/tempdump` C# 项目**（71 个文件）：早已被 Rust+WinRing0
+  方案取代，却把整个 .NET 8 的 `bin/obj` 连同 Linux/Android/macOS 全套运行时
+  DLL 都提交进了版本库
+- 🧹 **删除 10 个一次性窗口调试脚本**（`activate_force` / `click_wechat` /
+  `drag_test` / `stress_activate` / `test_browsers` 等互相重叠的 ctypes 变体），
+  需要时从 git 历史找回
+- 🧹 **删除 `PresentMon.exe`**（388KB，FPS 方案已弃用，代码零引用）
+- 🔒 `SensorHub` 从 `pub` 收窄为 crate 私有——全仓库只有 `sensor_loop` 一处使用
+
+**说明**
+- 纯仓库卫生版本，应用功能与 v1.3.2 完全一致；核心代码本就克制，本次净删
+  3600+ 行、零新增抽象
+
+</details>
+
+<details>
 <summary><b>v1.3.2 · 驱动装载自愈（CPU 温度消失根治）</b></summary>
 
 **修复**
@@ -375,7 +394,7 @@ GPU 空闲时 Windows 会注销 PDH 计数器实例。已内置 15 秒防抖沿�
 │  └─ tempmon-sensor/   # 采集：PDH/DXGI/NVML/共享内存协议
 │     ├─ src/ring0.rs   # CPU 温度+风扇（WinRing0 进程内直读：Intel MSR / AMD SMN；Nuvoton/ITE 风扇；驱动装载自愈）
 │     └─ driver/        # lhm-bridge.sys（build.rs 构建期自动复制到 exe 目录）
-├─ tools/               # 诊断脚本（避让检测 / 盘温验证）
+├─ tools/               # 诊断脚本（图标生成 / UIA 对齐验证 / 盘温验证）
 ├─ 方案.md              # 技术方案（架构/选型/风险/里程碑）
 └─ 开发记录.md          # 开发日志 + 踩坑记录
 ```

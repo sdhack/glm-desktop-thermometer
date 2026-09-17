@@ -61,5 +61,5 @@
 - 手动拖动 → `user_pinned=true`：x 尊重用户，y 仍需同步
   （`sync=true` 走 `title_sync_from_strip`）。
 - debug 日志：TEMPMON_DODGE_DEBUG=1。
-- 测试脚本：tools/test_browsers.py、tools/activate_force.py、
+- 测试脚本（v1.3.3 已从仓库删除，见 git 历史）：tools/test_browsers.py、tools/activate_force.py、
   tools/measure_align.py。
