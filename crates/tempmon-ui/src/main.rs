@@ -5,6 +5,7 @@
 #![allow(non_snake_case)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod net;
 mod strategy;
 
 use std::mem::zeroed;
@@ -148,6 +149,10 @@ const MENU_ROTATE_BASE: usize = 260;
 const MENU_REFRESH_BASE: usize = 270;
 const MENU_BG_BASE: usize = 280;
 const MENU_DODGE_BASE: usize = 290;
+// 网络监控：网卡选择（300..300+1+N，首项"全部网卡求和"）与速率单位
+const MENU_NET_BASE: usize = 300;
+const MENU_NET_ITEMS: usize = 24; // 含"全部网卡"项，其余为具体网卡
+const MENU_NETUNIT_BASE: usize = 340;
 const WM_APP_CTRL: u32 = WM_APP + 1;
 const WM_APP_WHEEL: u32 = WM_APP + 2;
 const WM_APP_DODGE: u32 = WM_APP + 3;
@@ -179,6 +184,7 @@ const CAPS_MEM: u32 = 1 << 5;
 const CAPS_DISK: u32 = 1 << 6;
 const CAPS_CPUTEMP: u32 = 1 << 7;
 const CAPS_FAN: u32 = 1 << 8;
+const CAPS_NET: u32 = 1 << 9;
 const CAPS_DEFAULT: u32 = CAPS_CPU | CAPS_CPUTEMP | CAPS_GPU | CAPS_GPUTEMP;
 
 const ROW_CPU: u32 = 1 << 0;
@@ -186,7 +192,8 @@ const ROW_GPU: u32 = 1 << 1;
 const ROW_MEM: u32 = 1 << 2;
 const ROW_DISK: u32 = 1 << 3;
 const ROW_FAN: u32 = 1 << 4;
-const ROW_DEFAULT: u32 = ROW_CPU | ROW_GPU | ROW_MEM | ROW_DISK | ROW_FAN;
+const ROW_NET: u32 = 1 << 5;
+const ROW_DEFAULT: u32 = ROW_CPU | ROW_GPU | ROW_MEM | ROW_DISK | ROW_FAN | ROW_NET;
 
 static TOPMOST_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 // 事件驱动防遮挡：其他窗口发生移动/显示/隐藏/前台切换时置位，tick 中消费
@@ -481,6 +488,8 @@ struct Config {
     dodge_secs: u32,
     pinned: bool,
     widest: i32,
+    net_luid: u64,
+    net_unit: u8,
 }
 
 struct App {
@@ -549,7 +558,7 @@ struct App {
     last_checked_w: i32,
     rendered_once: bool,
     // 上次成功渲染的（快照, 胶囊页, 透明度）：全都没变且无动画时跳过整帧 D2D 排版重绘
-    last_rendered: Option<(Snapshot, u32, u8)>,
+    last_rendered: Option<(Snapshot, u32, u8, Option<(u32, u32)>)>,
     dodge_secs: u32,
     user_pinned: bool,
     started_at: Instant,
@@ -561,6 +570,13 @@ struct App {
     last_sync_check: Option<Instant>,
     fb_d: f32,
     fb_runs: u32,
+    // 网络监控：选中的网卡 LUID（0 = 全部求和）、单位模式、当前速率与上次字节计数
+    net_luid: u64,
+    net_unit: u8,
+    net_rates: Option<(f32, f32)>,
+    net_prev: Option<(Instant, std::collections::HashMap<u64, (u64, u64)>)>,
+    // 菜单打开时枚举的网卡列表（菜单项 ID → LUID 映射）
+    net_menu_luids: Vec<u64>,
 }
 
 // ── 配置持久化 ──
@@ -583,7 +599,10 @@ fn load_config() -> Config {
         dodge_secs: 1,
         pinned: false,
         widest: 0,
+        net_luid: 0,
+        net_unit: 0,
     };
+    let mut has_cfgver = false;
     if let Some(text) = tempmon_sensor::read_config_text() {
         {
             for line in text.lines() {
@@ -591,11 +610,22 @@ fn load_config() -> Config {
                     Some(kv) => kv,
                     None => continue,
                 };
+                // u64 的网卡 LUID 超出 i32 通道，单独解析
+                if k.trim() == "netif" {
+                    if let Ok(u) = v.trim().parse::<u64>() {
+                        cfg.net_luid = u;
+                    }
+                    continue;
+                }
+                if k.trim() == "cfgver" {
+                    has_cfgver = true;
+                    continue;
+                }
                 match (k.trim(), v.trim().parse::<i32>()) {
                     ("collapsed", Ok(b)) => cfg.collapsed = b != 0,
                     ("alpha", Ok(a)) if (60..=255).contains(&a) => cfg.alpha = a as u8,
-                    ("capsule", Ok(v)) if (0..0x200).contains(&v) => cfg.capsule_items = v as u32,
-                    ("row", Ok(v)) if (0..0x20).contains(&v) => cfg.row_items = v as u32,
+                    ("capsule", Ok(v)) if (0..0x400).contains(&v) => cfg.capsule_items = v as u32,
+                    ("row", Ok(v)) if (0..0x40).contains(&v) => cfg.row_items = v as u32,
                     ("rotate", Ok(v)) if (500..=10000).contains(&v) => cfg.rotate_ms = v as u32,
                     ("refresh", Ok(v)) if (250..=5000).contains(&v) => cfg.refresh_ms = v as u32,
                     ("bg", Ok(v)) if (0..=3).contains(&v) => cfg.bg_mode = v as u8,
@@ -605,6 +635,7 @@ fn load_config() -> Config {
                     }
                     ("pinned", Ok(b)) => cfg.pinned = b != 0,
                     ("widest", Ok(n)) => cfg.widest = n,
+                    ("netunit", Ok(v)) if (0..=2).contains(&v) => cfg.net_unit = v as u8,
                     ("x", Ok(x)) => {
                         cfg.pos = Some(POINT { x, y: cfg.pos.map(|q| q.y).unwrap_or(0) })
                     }
@@ -615,6 +646,12 @@ fn load_config() -> Config {
                 }
             }
         }
+    }
+    // 配置版本迁移：cfgver= 行由新版写入；缺失即旧版配置，一次性打开网速显示
+    // （保存时写入 cfgver=1，此后用户关掉网速也不会被强制打开）
+    if !has_cfgver {
+        cfg.row_items |= ROW_NET;
+        cfg.capsule_items |= CAPS_NET;
     }
     // 吸附到最近档位：历史配置里的任意值（如旧默认 230）在菜单中无勾可对
     cfg.alpha = *ALPHA_CHOICES
@@ -633,7 +670,7 @@ fn save_config(cfg: &Config) {
             None => String::new(),
         };
         let text = format!(
-            "collapsed={}\nalpha={}\ncapsule={}\nrow={}\nrotate={}\nrefresh={}\nbg={}\ndodge={}\npinned={}\n{}",
+            "collapsed={}\nalpha={}\ncapsule={}\nrow={}\nrotate={}\nrefresh={}\nbg={}\ndodge={}\npinned={}\nnetif={}\nnetunit={}\ncfgver=1\n{}",
             cfg.collapsed as u8,
             cfg.alpha,
             cfg.capsule_items,
@@ -643,6 +680,8 @@ fn save_config(cfg: &Config) {
             cfg.bg_mode,
             cfg.dodge_secs,
             cfg.pinned as u8,
+            cfg.net_luid,
+            cfg.net_unit,
             pos_line,
         );
         let _ = std::fs::write(p, text);
@@ -936,6 +975,11 @@ impl App {
         last_sync_check: None,
         fb_d: 0.0,
         fb_runs: 0,
+        net_luid: cfg.net_luid,
+        net_unit: cfg.net_unit,
+        net_rates: None,
+        net_prev: None,
+        net_menu_luids: Vec::new(),
             };
             app.ensure_sensor_alive();
             Ok(app)
@@ -1038,6 +1082,7 @@ impl App {
         }
         self.update_clickthrough();
         self.ensure_sensor_alive();
+        self.net_update();
 
         // 周期性工作集修剪（约每 10 分钟）：让 OS 换出冷页，
         // 任务管理器占用常年保持低位；悬停/拖拽期间跳过避免微小卡顿
@@ -1113,12 +1158,57 @@ impl App {
         // 跳过整帧排版+重绘（温度数据 1s 才动一点，多数 tick 是纯浪费）
         if self.fade_phase == 0
             && !self.hidden
-            && self.last_rendered.as_ref() == Some(&(snap.clone(), self.capsule_page, self.alpha))
+            && self.last_rendered.as_ref() == Some(&(snap.clone(), self.capsule_page, self.alpha, self.net_rates.map(|(r, t)| (r as u32, t as u32))))
         {
             return Ok(());
         }
-        self.last_rendered = Some((snap.clone(), self.capsule_page, self.alpha));
+        self.last_rendered = Some((snap.clone(), self.capsule_page, self.alpha, self.net_rates.map(|(r, t)| (r as u32, t as u32))));
         self.render(&snap)
+    }
+
+    /// 采样网卡字节计数并与上次差分，得出上下行速率（字节/秒）。
+    /// 每 tick 一次；首帧只有基准样本，无速率。计数器回绕/重连清零时丢本帧。
+    fn net_update(&mut self) {
+        let now = Instant::now();
+        let map: std::collections::HashMap<u64, (u64, u64)> = net::interfaces()
+            .into_iter()
+            .map(|i| (i.luid, (i.rx_bytes, i.tx_bytes)))
+            .collect();
+        self.net_rates = match &self.net_prev {
+            Some((t0, m0)) => {
+                let dt = t0.elapsed().as_secs_f32();
+                if dt < 0.2 {
+                    self.net_rates // 间隔太短（避让动画 16ms tick），沿用上次
+                } else {
+                    let delta = |k: u64| -> Option<(f32, f32)> {
+                        let (a0, b0) = m0.get(&k).copied()?;
+                        let (a1, b1) = map.get(&k).copied()?;
+                        let (dr, dtb) = (a1 as i128 - a0 as i128, b1 as i128 - b0 as i128);
+                        if dr < 0 || dtb < 0 {
+                            return None;
+                        }
+                        Some((dr as f32 / dt, dtb as f32 / dt))
+                    };
+                    let rates = if self.net_luid != 0 {
+                        delta(self.net_luid)
+                    } else {
+                        let mut any = false;
+                        let (mut sr, mut st) = (0.0f32, 0.0f32);
+                        for &k in map.keys() {
+                            if let Some((r, t)) = delta(k) {
+                                sr += r;
+                                st += t;
+                                any = true;
+                            }
+                        }
+                        any.then_some((sr, st))
+                    };
+                    rates.map(|(r, t)| (r.max(0.0), t.max(0.0)))
+                }
+            }
+            None => None,
+        };
+        self.net_prev = Some((now, map));
     }
 
     fn update_clickthrough(&mut self) -> windows::core::Result<()> {
@@ -1208,6 +1298,23 @@ impl App {
             parts.push(Part::new("FAN ".into(), gray));
             for r in &s.fans {
                 parts.push(Part::val(format!("{:.0} ", r), white, "9999 "));
+            }
+        }
+        if self.row_items & ROW_NET != 0 {
+            if let Some((rx, tx)) = self.net_rates {
+                parts.push(Part { text: " │ ".into(), color: sep, slot: None, dot: false });
+                parts.push(Part::new("NET ".into(), gray));
+                // 无分隔符紧凑格式：收速尾随空隙兼作与发速的间隔，比 / 版省一个分段+间距
+                parts.push(Part::val(
+                    format!("{} ", net::fmt_speed_short(rx, self.net_unit)),
+                    blue,
+                    "88.8M",
+                ));
+                parts.push(Part::val(
+                    net::fmt_speed_short(tx, self.net_unit),
+                    purple,
+                    "88.8M",
+                ));
             }
         }
         parts
@@ -1329,6 +1436,19 @@ impl App {
             pages.push(pg);
         }
 
+        if it & CAPS_NET != 0 {
+            if let Some((rx, tx)) = self.net_rates {
+                pages.push(vec![
+                    Part::dot(dot),
+                    // 与 CPU/GPU 页同构：标签 + 两值（无分隔符），预留 88.8M×2
+                    // 恰好等价于 "100%"+" 100°" 的宽度，整页与 CPU/GPU 页等宽
+                    Part::new("NET ".into(), gray),
+                    Part::val(net::fmt_speed_short(rx, self.net_unit), blue, "88.8K"),
+                    Part::val(net::fmt_speed_short(tx, self.net_unit), purple, "88.8K"),
+                ]);
+            }
+        }
+
         if pages.is_empty() {
             pages.push(vec![Part::dot(dot)]);
         }
@@ -1381,6 +1501,13 @@ impl App {
             }
             if page_laid.is_empty() {
                 return Ok(());
+            }
+            let dump = self.debug_on();
+            if dump {
+                for (pg, t) in &page_laid {
+                    let head = pg.iter().map(|(p, ..)| p.text.clone()).collect::<Vec<_>>().join("|");
+                    eprintln!("[capsule-width] total={t:.1} parts=[{head}]");
+                }
             }
             // 所有翻页的总宽每帧都已排版算出：取最大者作为最宽形态宽度，
             // 防遮挡检测无需等宽页轮播显示就能覆盖真实占位
@@ -1588,7 +1715,7 @@ impl App {
         }
     }
 
-    unsafe fn show_menu(&self) {
+    unsafe fn show_menu(&mut self) {
         if let Ok(menu) = CreatePopupMenu() {
             let _ = AppendMenuW(
                 menu,
@@ -1638,12 +1765,13 @@ impl App {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
             if let Ok(sub) = CreatePopupMenu() {
-                let opts: [(usize, PCWSTR, u32); 5] = [
+                let opts: [(usize, PCWSTR, u32); 6] = [
                     (0, w!("CPU 段"), ROW_CPU),
                     (1, w!("GPU 段"), ROW_GPU),
                     (2, w!("内存段"), ROW_MEM),
                     (3, w!("硬盘段"), ROW_DISK),
                     (4, w!("风扇段"), ROW_FAN),
+                    (5, w!("网速段"), ROW_NET),
                 ];
                 for (i, label, bit) in opts {
                     let _ = AppendMenuW(
@@ -1657,7 +1785,7 @@ impl App {
                 let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("显示内容"));
             }
             if let Ok(sub) = CreatePopupMenu() {
-                let opts: [(usize, PCWSTR, u32); 9] = [
+                let opts: [(usize, PCWSTR, u32); 10] = [
                     (0, w!("最高温度"), CAPS_MAXTEMP),
                     (1, w!("CPU 占用"), CAPS_CPU),
                     (7, w!("CPU 温度"), CAPS_CPUTEMP),
@@ -1667,6 +1795,7 @@ impl App {
                     (5, w!("内存占用"), CAPS_MEM),
                     (6, w!("硬盘温度"), CAPS_DISK),
                     (8, w!("风扇转速"), CAPS_FAN),
+                    (9, w!("网速"), CAPS_NET),
                 ];
                 for (i, label, bit) in opts {
                     let _ = AppendMenuW(
@@ -1678,6 +1807,57 @@ impl App {
                     );
                 }
                 let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("胶囊显示项"));
+            }
+            // 网络子菜单：网卡选择 + 速率单位。LUID 列表存到 net_menu_luids
+            // 供 WM_COMMAND 反查（LUID 不进菜单 ID）
+            {
+                let ifs = net::interfaces();
+                if let Ok(sub) = CreatePopupMenu() {
+                    let _ = AppendMenuW(
+                        sub,
+                        MF_STRING | if self.net_luid == 0 { MF_CHECKED } else { MF_UNCHECKED },
+                        MENU_NET_BASE,
+                        w!("全部网卡（求和）"),
+                    );
+                    self.net_menu_luids.clear();
+                    for nic in ifs.iter().take(MENU_NET_ITEMS - 1) {
+                        let name = if nic.alias.is_empty() {
+                            format!("网卡{:x}", nic.luid)
+                        } else {
+                            nic.alias.clone()
+                        };
+                        let label: Vec<u16> = format!(
+                            "{}{}\0",
+                            if nic.connected { "● " } else { "○ " },
+                            name
+                        )
+                        .encode_utf16()
+                        .collect();
+                        self.net_menu_luids.push(nic.luid);
+                        let id = MENU_NET_BASE + self.net_menu_luids.len();
+                        let _ = AppendMenuW(
+                            sub,
+                            MF_STRING
+                                | if self.net_luid == nic.luid { MF_CHECKED } else { MF_UNCHECKED },
+                            id,
+                            PCWSTR::from_raw(label.as_ptr()),
+                        );
+                    }
+                    if let Ok(usub) = CreatePopupMenu() {
+                        for (i, label) in [w!("自动"), w!("KB/s"), w!("MB/s")].into_iter().enumerate()
+                        {
+                            let _ = AppendMenuW(
+                                usub,
+                                MF_STRING
+                                    | if self.net_unit == i as u8 { MF_CHECKED } else { MF_UNCHECKED },
+                                MENU_NETUNIT_BASE + i,
+                                label,
+                            );
+                        }
+                        let _ = AppendMenuW(sub, MF_POPUP, usub.0 as usize, w!("速率单位"));
+                    }
+                    let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, w!("网络"));
+                }
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
@@ -2179,16 +2359,9 @@ impl App {
                     if self.begin_capture(strip_x, ctx.wa.top, strip_w, sh, true, false) {
                         return;
                     }
-                } else if self.user_pinned && sync_due {
-                    // 手动钉定：x 尊重用户，仅同步 y 到标题栏按钮带（sync=true 走
-                    // title_sync_from_strip，只修 y）
-                    let strip_x = ctx.wa.left;
-                    let strip_w = ctx.wa.right - ctx.wa.left;
-                    let sh = (ctx.y + ctx.h - ctx.wa.top).max(48);
-                    if self.begin_capture(strip_x, ctx.wa.top, strip_w, sh, false, true) {
-                        return;
-                    }
                 }
+                // 固定位置：不做 y 同步——把钉定的胶囊拉回标题栏按钮带高度
+                // 违背"固定"语义，且每次同步带淡出淡入动画 = 周期性闪一下
                 self.dctx = None;
                 return; // 常态：无遮挡
             }
@@ -2211,6 +2384,13 @@ impl App {
 
         // 第二阶段：整行边缘图上选新位置
         let Some(ctx) = self.dctx else { return };
+        // 固定位置：跳过全部选位/移动（含"最靠右空位"与兜底密度分支）——
+        // 用户钉定后遮挡误判（标题栏动画等）也不挪，否则表现为周期性
+        // 闪一下并被挪向右上角空位
+        if self.user_pinned {
+            self.dctx = None;
+            return;
+        }
         // UIA 查询未出结论时不做任何选位/移动：等 burst 下一轮再定位，
         // 避免"先按估算值跳一次、查询返回后再修正"的多段跳动
         if !self.user_pinned && matches!(uia_anchor_state(self.last_fg_hwnd), AnchorState::Pending) {
@@ -2706,6 +2886,8 @@ impl App {
             dodge_secs: self.dodge_secs,
             pinned: self.user_pinned,
             widest: self.widest,
+            net_luid: self.net_luid,
+            net_unit: self.net_unit,
         }
     }
 
@@ -3410,13 +3592,13 @@ unsafe extern "system" fn wndproc(
                         (*ptr).user_pinned = !(*ptr).user_pinned;
                         save_config(&(*ptr).as_config());
                     }
-                    id if (MENU_CAPSULE_BASE..MENU_CAPSULE_BASE + 9).contains(&id) => {
+                    id if (MENU_CAPSULE_BASE..MENU_CAPSULE_BASE + 10).contains(&id) => {
                         let bit = 1u32 << (id - MENU_CAPSULE_BASE);
                         (*ptr).capsule_items ^= bit;
                         (*ptr).widest = 0;
                         save_config(&(*ptr).as_config());
                     }
-                    id if (MENU_ROW_BASE..MENU_ROW_BASE + 5).contains(&id) => {
+                    id if (MENU_ROW_BASE..MENU_ROW_BASE + 6).contains(&id) => {
                         let bit = 1u32 << (id - MENU_ROW_BASE);
                         (*ptr).row_items ^= bit;
                         (*ptr).widest = 0;
@@ -3441,6 +3623,20 @@ unsafe extern "system" fn wndproc(
                     {
                         (*ptr).dodge_secs = DODGE_CHOICES_SECS[id - MENU_DODGE_BASE];
                         (*ptr).last_dodge = None; // 立即按新周期执行一次检测
+                        save_config(&(*ptr).as_config());
+                    }
+                    id if (MENU_NET_BASE..MENU_NET_BASE + MENU_NET_ITEMS).contains(&id) => {
+                        (*ptr).net_luid = if id == MENU_NET_BASE {
+                            0
+                        } else {
+                            let luids = &(*ptr).net_menu_luids;
+                            luids.get(id - MENU_NET_BASE - 1).copied().unwrap_or(0)
+                        };
+                        (*ptr).net_prev = None; // 换网卡后等下一次差分，避免跨卡算速率
+                        save_config(&(*ptr).as_config());
+                    }
+                    id if (MENU_NETUNIT_BASE..MENU_NETUNIT_BASE + 3).contains(&id) => {
+                        (*ptr).net_unit = (id - MENU_NETUNIT_BASE) as u8;
                         save_config(&(*ptr).as_config());
                     }
                     _ => {}
